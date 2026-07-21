@@ -88,6 +88,8 @@ def _pick_market(lst, exchange, base):
         "index_price": it.get("index_price"),
         "instrument": it.get("instrument_id"),
         "volume_usd": it.get("volume_usd"),
+        "oi_usd": it.get("open_interest_usd"),
+        "oi_chg_24h": it.get("open_interest_change_percent_24h"),
     }
 
 
@@ -779,7 +781,7 @@ PAGE = r"""<!DOCTYPE html>
   .dna{color:var(--muted);font-size:12px;line-height:1.7}
   .derr{margin-top:6px;font-size:10px;color:var(--faint);overflow-wrap:anywhere}
   .dnote{margin-top:10px;font-size:10px;color:var(--faint)}
-  .pxgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:12px}
+  .pxgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:12px}
   @media(max-width:900px){.pxgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
   .pxcard{background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:12px 14px}
   .pxcard.long{border-top:3px solid var(--long)}
@@ -922,6 +924,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="navitem" data-page="page-history"><span class="navnum">03</span>Coin Research</div>
   <div class="navitem" data-page="page-calc"><span class="navnum">04</span>Profit Calculator</div>
   <div class="navitem" data-page="page-explain"><span class="navnum">05</span>How This Trade Works</div>
+  <div class="navitem" data-page="page-btexplain"><span class="navnum">06</span>How Backtesting Works</div>
 </nav>
 <div class="pagearea">
 
@@ -1134,6 +1137,8 @@ PAGE = r"""<!DOCTYPE html>
   <div class="controls" style="gap:10px;margin-bottom:16px">
     <div class="ctl"><label for="cPick">Load a live pair</label>
       <select id="cPick" style="width:260px"><option value="">— manual entry —</option></select></div>
+    <div class="ctl"><label>&nbsp;</label><button id="cFetchPx" class="ghost">📡 Fetch live prices &amp; OI for this pair</button></div>
+    <div class="ctl"><label>&nbsp;</label><span id="cFetchStatus" class="dsub"></span></div>
   </div>
 
   <div class="calcgrid">
@@ -1158,6 +1163,8 @@ PAGE = r"""<!DOCTYPE html>
       <div class="cfield"><label>Long price at exit</label><input id="cPxLX" type="number" value="1.0000" step="0.0001"></div>
       <div class="cfield"><label>Short price at exit</label><input id="cPxSX" type="number" value="1.0000" step="0.0001"></div>
       <div class="cfield"><label>Index/spot price at exit</label><input id="cPxIX" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Long venue open interest (USD)</label><input id="cOiL" type="number" value="" placeholder="auto or manual"></div>
+      <div class="cfield"><label>Short venue open interest (USD)</label><input id="cOiS" type="number" value="" placeholder="auto or manual"></div>
 
       <div class="pxlabel" style="margin:16px 0 10px">4 · HOLD &amp; COSTS</div>
       <div class="cfield"><label>Hold duration (hours)</label><input id="cHold" type="number" value="24" min="1" step="1"></div>
@@ -1168,6 +1175,141 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </main>
 </div><!-- /page-calc -->
+
+<div class="page" id="page-btexplain">
+<header style="border-bottom:1px solid var(--edge);padding:28px 32px 20px">
+  <div class="brand">
+    <h1>HOW <span>BACKTESTING</span> WORKS</h1>
+    <p>No trading or coding background needed — here's exactly what happens when you click "Run Backtest."</p>
+  </div>
+</header>
+<main style="padding:20px 32px 70px;max-width:900px;margin:0 auto;font-size:14px;line-height:1.8;color:var(--muted)">
+
+  <div class="btpanel" style="margin-bottom:20px">
+    <div class="pbtitle" style="margin-bottom:14px">THE BASIC IDEA</div>
+    <p style="color:var(--text)">A backtest is a <b>rehearsal using the past</b>. Instead of risking real money to find out
+    whether a trade idea works, the computer replays several weeks of real history — what the funding rate actually was,
+    what the price actually did, hour by hour — and pretends to take the trade every time the opportunity would have
+    appeared. At the end, it tallies up what would have happened.</p>
+    <p style="margin-top:10px">Think of it like a flight simulator: you find out how the plane handles turbulence
+    <b>before</b> you're actually in the air.</p>
+  </div>
+
+  <div class="btpanel" style="margin-bottom:20px">
+    <div class="pbtitle" style="margin-bottom:14px">THE FIVE STEPS</div>
+    <svg viewBox="0 0 820 300" style="width:100%;height:auto">
+      <text x="410" y="24" text-anchor="middle" fill="#E8ECF4" font-family="Space Grotesk" font-weight="700" font-size="14">WALKING THROUGH THE PAST, ONE HOUR AT A TIME</text>
+
+      <rect x="10" y="45" width="150" height="120" rx="8" fill="#0F1420" stroke="#F2C14E" stroke-width="1.5"/>
+      <text x="85" y="65" text-anchor="middle" fill="#F2C14E" font-family="Space Grotesk" font-weight="700" font-size="12">1. GATHER</text>
+      <text x="85" y="88" text-anchor="middle" fill="#7E89A3" font-size="10">Download weeks of real</text>
+      <text x="85" y="102" text-anchor="middle" fill="#7E89A3" font-size="10">funding rates &amp; prices</text>
+      <text x="85" y="116" text-anchor="middle" fill="#7E89A3" font-size="10">from both exchanges</text>
+
+      <rect x="175" y="45" width="150" height="120" rx="8" fill="#0F1420" stroke="#F2C14E" stroke-width="1.5"/>
+      <text x="250" y="65" text-anchor="middle" fill="#F2C14E" font-family="Space Grotesk" font-weight="700" font-size="12">2. WALK FORWARD</text>
+      <text x="250" y="88" text-anchor="middle" fill="#7E89A3" font-size="10">Step through history</text>
+      <text x="250" y="102" text-anchor="middle" fill="#7E89A3" font-size="10">hour by hour, checking:</text>
+      <text x="250" y="116" text-anchor="middle" fill="#7E89A3" font-size="10">"is the gap big enough</text>
+      <text x="250" y="130" text-anchor="middle" fill="#7E89A3" font-size="10">right now?"</text>
+
+      <rect x="340" y="45" width="150" height="120" rx="8" fill="#0F1420" stroke="#F2C14E" stroke-width="1.5"/>
+      <text x="415" y="65" text-anchor="middle" fill="#F2C14E" font-family="Space Grotesk" font-weight="700" font-size="12">3. PRETEND TRADE</text>
+      <text x="415" y="88" text-anchor="middle" fill="#7E89A3" font-size="10">Found a good moment?</text>
+      <text x="415" y="102" text-anchor="middle" fill="#7E89A3" font-size="10">"Open" both legs there,</text>
+      <text x="415" y="116" text-anchor="middle" fill="#7E89A3" font-size="10">collect the real historical</text>
+      <text x="415" y="130" text-anchor="middle" fill="#7E89A3" font-size="10">payments, then "close"</text>
+
+      <rect x="505" y="45" width="150" height="120" rx="8" fill="#0F1420" stroke="#F2C14E" stroke-width="1.5"/>
+      <text x="580" y="65" text-anchor="middle" fill="#F2C14E" font-family="Space Grotesk" font-weight="700" font-size="12">4. GRADE IT</text>
+      <text x="580" y="88" text-anchor="middle" fill="#7E89A3" font-size="10">Money collected, minus</text>
+      <text x="580" y="102" text-anchor="middle" fill="#7E89A3" font-size="10">fees and any price moves</text>
+      <text x="580" y="116" text-anchor="middle" fill="#7E89A3" font-size="10">against you = win or loss</text>
+      <text x="580" y="130" text-anchor="middle" fill="#7E89A3" font-size="10">for that one attempt</text>
+
+      <rect x="660" y="45" width="150" height="120" rx="8" fill="#0F1420" stroke="#F2C14E" stroke-width="1.5"/>
+      <text x="735" y="65" text-anchor="middle" fill="#F2C14E" font-family="Space Grotesk" font-weight="700" font-size="12">5. SUM IT UP</text>
+      <text x="735" y="88" text-anchor="middle" fill="#7E89A3" font-size="10">Repeat for every moment</text>
+      <text x="735" y="102" text-anchor="middle" fill="#7E89A3" font-size="10">found, then average the</text>
+      <text x="735" y="116" text-anchor="middle" fill="#7E89A3" font-size="10">results into a report</text>
+      <text x="735" y="130" text-anchor="middle" fill="#7E89A3" font-size="10">and a recommendation</text>
+
+      <path d="M160 105 L175 105" stroke="#4A5570" stroke-width="2" marker-end="url(#a1)"/>
+      <path d="M325 105 L340 105" stroke="#4A5570" stroke-width="2" marker-end="url(#a2)"/>
+      <path d="M490 105 L505 105" stroke="#4A5570" stroke-width="2" marker-end="url(#a3)"/>
+      <path d="M655 105 L660 105" stroke="#4A5570" stroke-width="2" marker-end="url(#a4)"/>
+      <defs>
+        <marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="none" stroke="#4A5570"/></marker>
+        <marker id="a2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="none" stroke="#4A5570"/></marker>
+        <marker id="a3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="none" stroke="#4A5570"/></marker>
+        <marker id="a4" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="none" stroke="#4A5570"/></marker>
+      </defs>
+
+      <line x1="20" y1="220" x2="800" y2="220" stroke="#222C47" stroke-width="2"/>
+      <circle cx="120" cy="220" r="5" fill="#4A5570"/>
+      <circle cx="260" cy="220" r="8" fill="#35D9BC"/>
+      <circle cx="400" cy="220" r="5" fill="#4A5570"/>
+      <circle cx="520" cy="220" r="8" fill="#35D9BC"/>
+      <circle cx="700" cy="220" r="5" fill="#4A5570"/>
+      <text x="260" y="245" text-anchor="middle" fill="#35D9BC" font-size="11" font-weight="600">gap was wide → trade taken</text>
+      <text x="520" y="245" text-anchor="middle" fill="#35D9BC" font-size="11" font-weight="600">gap was wide → trade taken</text>
+      <text x="410" y="270" text-anchor="middle" fill="#7E89A3" font-size="11">Timeline of real history — most hours nothing happens; the backtest only "trades" at the moments the rule would have fired</text>
+    </svg>
+  </div>
+
+  <div class="btpanel" style="margin-bottom:20px">
+    <div class="pbtitle" style="margin-bottom:14px">READING THE REPORT — IN PLAIN WORDS</div>
+    <p><b style="color:var(--text)">Trades</b> — how many separate times, over the whole history window, the opportunity
+    appeared and was actually taken. A pair that only qualified twice tells you very little; one that qualified
+    15 times is a pattern you can trust more.</p>
+    <p style="margin-top:8px"><b style="color:var(--text)">Win rate</b> — out of those attempts, what percentage came out
+    ahead after every cost was subtracted. 100% win rate on 2 trades might just be luck; 70% on 15 trades is a real edge.</p>
+    <p style="margin-top:8px"><b style="color:var(--text)">Edge decay chart</b> — a set of bars showing how big the
+    opportunity typically was 1 cycle after entering, 2 cycles after, 3 cycles after… Falling bars mean the free money
+    fades fast, which tells the computer (and you) how long to actually hold before it's not worth it anymore.</p>
+    <p style="margin-top:8px"><b style="color:var(--text)">Liquidation frequency</b> — out of all those historical
+    moments, how often would the price have swung far enough to wipe out your position at a given leverage. This is
+    measured from what the price <i>actually did</i> historically, not guessed.</p>
+    <p style="margin-top:8px">All of this feeds one final output: a <b style="color:var(--text)">recommended playbook</b> —
+    what size to trade, how much leverage, how long to hold, and where to set alerts — built directly from what
+    actually happened in the past, not a guess.</p>
+  </div>
+
+  <div class="btpanel">
+    <div class="pbtitle" style="margin-bottom:14px">WHY A BACKTEST ISN'T A GUARANTEE</div>
+    <svg viewBox="0 0 780 90" style="width:100%;height:auto;margin-bottom:12px">
+      <text x="15" y="20" fill="#F2C14E" font-family="Space Grotesk" font-weight="700" font-size="12">The decay curve — a real example</text>
+      <g>
+        <rect x="30" y="30" width="34" height="45" fill="#F2C14E"/>
+        <rect x="90" y="45" width="34" height="30" fill="#F2C14E"/>
+        <rect x="150" y="58" width="34" height="17" fill="#F2C14E"/>
+        <rect x="210" y="66" width="34" height="9" fill="#FF6470"/>
+        <rect x="270" y="70" width="34" height="5" fill="#FF6470"/>
+        <text x="47" y="88" text-anchor="middle" fill="#7E89A3" font-size="9">cycle 1</text>
+        <text x="107" y="88" text-anchor="middle" fill="#7E89A3" font-size="9">cycle 2</text>
+        <text x="167" y="88" text-anchor="middle" fill="#7E89A3" font-size="9">cycle 3</text>
+        <text x="227" y="88" text-anchor="middle" fill="#7E89A3" font-size="9">cycle 4</text>
+        <text x="287" y="88" text-anchor="middle" fill="#7E89A3" font-size="9">cycle 5</text>
+      </g>
+      <text x="340" y="55" fill="#7E89A3" font-size="11">← the opportunity shrinks the longer you hold it,</text>
+      <text x="340" y="72" fill="#7E89A3" font-size="11">   which is exactly what the backtest measures for you</text>
+    </svg>
+    <p>A backtest can only ever tell you what <b class="r-short">would have happened</b> under the exact past conditions
+    it was given. A few honest limits worth knowing:</p>
+    <p style="margin-top:8px">• <b style="color:var(--text)">It only sees coins that still exist today.</b> If a coin
+    crashed or got delisted after a wild funding spike, it's gone from the list of things being tested — so the very
+    worst outcomes are quietly missing from the history.</p>
+    <p style="margin-top:6px">• <b style="color:var(--text)">The future can differ from the past.</b> A pattern that
+    repeated 10 times in the last month might not repeat next month — markets change.</p>
+    <p style="margin-top:6px">• <b style="color:var(--text)">Some numbers are estimates, not certainties</b> — like how
+    much the price would move when your order tries to fill (slippage), which is modeled mathematically rather than
+    lived through for real.</p>
+    <p style="margin-top:10px">Treat the backtest as a <b style="color:var(--text)">well-informed guide, not a promise</b>.
+    It's far better than trading on a gut feeling or a single flashy number — but it's still describing the past.</p>
+  </div>
+
+</main>
+</div><!-- /page-btexplain -->
 
 </div><!-- /pagearea -->
 </div><!-- /applayout -->
@@ -1532,16 +1674,24 @@ function priceStrip(d, px){
   const devS = idx ? (px.short.price-idx)/idx*100 : null;
   const vol = v => v!=null ? oiShort(v)+" 24h vol" : "vol n/a";
   const dev = v => v==null ? "" : ` · ${(v>=0?"+":"")+v.toFixed(2)}% vs index`;
+  const oiL = px.long.oi_usd, oiS = px.short.oi_usd;
+  const pctL = oiL ? lastUsd/oiL*100 : null;
+  const pctS = oiS ? lastUsd/oiS*100 : null;
+  const worstPct = [pctL, pctS].filter(x=>x!=null).length ? Math.max(...[pctL,pctS].filter(x=>x!=null)) : null;
+  const impactTag = p => p==null ? ['na','OI N/A'] : p<0.5 ? ['ok','LOW ('+p.toFixed(2)+'%)'] : p<2 ? ['mid','MODERATE ('+p.toFixed(2)+'%)'] : ['bad','HIGH ('+p.toFixed(2)+'%)'];
+  const [itCls, itTxt] = impactTag(worstPct);
   return `<div class="pxgrid">
     <div class="pxcard long">
       <div class="pxlabel">Long · buy here</div>
       <div class="pxval r-long">${fmtPx(px.long.price)}</div>
       <div class="pxsub">${d.buy.exchange} · ${vol(px.long.volume_usd)}${dev(devL)}</div>
+      <div class="pxsub">OI ${oiL?oiShort(oiL):"n/a"}${pctL!=null?` · your size = ${pctL.toFixed(2)}% of OI`:""}</div>
     </div>
     <div class="pxcard short">
       <div class="pxlabel">Short · sell here</div>
       <div class="pxval r-short">${fmtPx(px.short.price)}</div>
       <div class="pxsub">${d.sell.exchange} · ${vol(px.short.volume_usd)}${dev(devS)}</div>
+      <div class="pxsub">OI ${oiS?oiShort(oiS):"n/a"}${pctS!=null?` · your size = ${pctS.toFixed(2)}% of OI`:""}</div>
     </div>
     <div class="pxcard">
       <div class="pxlabel">Mid ${idx?"/ Index":""}</div>
@@ -1553,6 +1703,11 @@ function priceStrip(d, px){
       <div class="pxval">${(disc>=0?"+":"")+disc.toFixed(3)}%</div>
       <div class="pxsub">${favorable?"sell high / buy low on entry":"you buy the expensive side"}</div>
       ${eats?`<div class="pxwarn">gap exceeds ${holdN}-cycle funding (${fundingOverHold.toFixed(2)}%)</div>`:""}
+    </div>
+    <div class="pxcard gap ${itCls==='ok'?'gok':itCls==='mid'?'gmid':itCls==='bad'?'gbad':''}">
+      <div class="pxlabel">Market impact (your size vs OI)</div>
+      <div class="pxval">${itTxt}</div>
+      <div class="pxsub">Worst-case leg — entering can push price AND compress funding on this venue.</div>
     </div>
   </div>`;
 }
@@ -1999,12 +2154,41 @@ $("cPick").addEventListener("change", ()=>{
   $("cShortRate").value = d.sell.funding_rate;
   $("cShortInt").value = d.sell.funding_rate_interval;
   $("cFee").value = (2*d.fee).toFixed(3);
-  calcRender();
+  fetchCalcLivePrices();
 });
 
 const CFIELDS = ["cSym","cUsd","cLev","cLongEx","cLongRate","cLongInt","cShortEx","cShortRate","cShortInt",
-                 "cPxLE","cPxSE","cPxIE","cPxLX","cPxSX","cPxIX","cHold","cFee"];
+                 "cPxLE","cPxSE","cPxIE","cPxLX","cPxSX","cPxIX","cOiL","cOiS","cHold","cFee"];
 CFIELDS.forEach(id=>{ const el=$(id); if(el) el.addEventListener("input", calcRender); });
+
+async function fetchCalcLivePrices(){
+  const sym = $("cSym").value.trim().toUpperCase();
+  const lx = $("cLongEx").value.trim();
+  const sx = $("cShortEx").value.trim();
+  if(!sym || !lx || !sx){ $("cFetchStatus").textContent = "Need symbol + both exchanges first."; return; }
+  $("cFetchStatus").textContent = "Fetching…";
+  try{
+    const r = await fetch(`/api/prices?symbol=${encodeURIComponent(sym)}&long=${encodeURIComponent(lx)}&short=${encodeURIComponent(sx)}`);
+    const j = await r.json();
+    if(String(j.code)!=="0" || !j.long || !j.short){ $("cFetchStatus").textContent = "No live price data for this pair/venue combo."; return; }
+    if(j.long.price!=null) $("cPxLE").value = j.long.price;
+    if(j.short.price!=null) $("cPxSE").value = j.short.price;
+    const idx = j.long.index_price ?? j.short.index_price;
+    if(idx!=null) $("cPxIE").value = idx;
+    // exit defaults to entry (no forecast) — edit manually to model a scenario
+    if(j.long.price!=null) $("cPxLX").value = j.long.price;
+    if(j.short.price!=null) $("cPxSX").value = j.short.price;
+    if(idx!=null) $("cPxIX").value = idx;
+    if(j.long.oi_usd!=null) $("cOiL").value = Math.round(j.long.oi_usd);
+    if(j.short.oi_usd!=null) $("cOiS").value = Math.round(j.short.oi_usd);
+    $("cFetchStatus").textContent = "Live prices loaded — exit fields default to entry, edit them to model a scenario.";
+    calcRender();
+  }catch(err){
+    $("cFetchStatus").textContent = "Fetch error: "+String(err.message).slice(0,120);
+  }
+}
+$("cFetchPx").onclick = fetchCalcLivePrices;
+
 
 function fmtMoney(n){ const s = n<0?"−":""; return s+"$"+Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
 function fmtPct4(n){ return (n>=0?"+":"")+Number(n).toFixed(4)+"%"; }
@@ -2024,6 +2208,15 @@ function calcRender(){
   const pxIE = Number($("cPxIE").value)||1, pxIX = Number($("cPxIX").value)||1;
   const hold = Math.max(1, Number($("cHold").value)||24);
   const feeRT = Math.max(0, Number($("cFee").value)||0);
+  const oiL = Number($("cOiL").value)||0, oiS = Number($("cOiS").value)||0;
+  const pctOiL = oiL>0 ? usd/oiL*100 : null;
+  const pctOiS = oiS>0 ? usd/oiS*100 : null;
+  const impactTag = p => p==null ? ['na','NO OI DATA — fetch or enter manually'] :
+    p<0.5 ? ['ok','LOW — unlikely to move price or funding'] :
+    p<2   ? ['mid','MODERATE — expect some price impact & funding compression'] :
+            ['bad','HIGH — you are likely to move both the price and the funding rate'];
+  const [itClsL, itTxtL] = impactTag(pctOiL);
+  const [itClsS, itTxtS] = impactTag(pctOiS);
 
   // deviation of each futures price from the underlying/index at entry & exit
   const devLE = pxIE ? (pxLE-pxIE)/pxIE*100 : 0, devSE = pxIE ? (pxSE-pxIE)/pxIE*100 : 0;
@@ -2080,6 +2273,17 @@ function calcRender(){
       </div>
     </div>
     <div class="dsub">Capital = 2 × position ÷ leverage = 2 × $${usd.toLocaleString()} ÷ ${lev} = ${fmtMoney(capital)} (margin posted on both exchanges).</div>
+  </div>
+
+  <div class="cstep">
+    <div class="pbtitle">STEP 0 — MARKET IMPACT CHECK (will entering move this yourself?)</div>
+    <div class="cline"><div><div class="clabel">Long leg — position vs open interest</div>
+      <span class="cformula">$${usd.toLocaleString()} ÷ ${oiL?fmtMoney(oiL):"?"} OI ${pctOiL!=null?"= "+pctOiL.toFixed(3)+"%":""}</span></div>
+      <div class="cval dchk ${itClsL}" style="border:none;background:none;padding:0">${itTxtL}</div></div>
+    <div class="cline"><div><div class="clabel">Short leg — position vs open interest</div>
+      <span class="cformula">$${usd.toLocaleString()} ÷ ${oiS?fmtMoney(oiS):"?"} OI ${pctOiS!=null?"= "+pctOiS.toFixed(3)+"%":""}</span></div>
+      <div class="cval dchk ${itClsS}" style="border:none;background:none;padding:0">${itTxtS}</div></div>
+    <div class="dsub" style="margin-top:6px">Rule of thumb: under ~0.5% of a venue's OI, your own order is unlikely to be the reason the price or funding rate moves. Above ~2%, assume you ARE the marginal flow — your entry price will likely be worse than the quote you're calculating from, and the funding rate can compress toward zero as you enter. Use "Fetch live prices &amp; OI" above, or enter OI manually from the Coin Research or Live Table pages.</div>
   </div>
 
   <div class="cstep">
