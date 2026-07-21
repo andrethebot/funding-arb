@@ -669,6 +669,7 @@ CCXT_MAP = {
     "coinex":   ("coinex", {"options": {"defaultType": "swap"}}),
     "whitebit": ("whitebit", {}),
     "bingx":    ("bingx", {"options": {"defaultType": "swap"}}),
+    "aster":    ("aster", {}),
 }
 
 _ccxt_instances = {}   # ccxt class id -> live exchange instance (markets loaded once, reused)
@@ -697,13 +698,34 @@ def _get_ccxt_exchange(display_name):
         _ccxt_instances[class_id] = ex
         return ex, None
     except Exception as exc:
-        return None, f"Couldn't connect to {display_name}'s API: {exc}"
+        return None, f"Couldn't connect to {display_name}'s API ({type(exc).__name__}): {exc}"
 
 
 def _ccxt_symbol_candidates(base):
     base = base.upper().strip()
     # try the common unified forms across ccxt exchanges, linear USDT perp first
     return [f"{base}/USDT:USDT", f"{base}/USDT", f"{base}/USD:USD", f"{base}/USD"]
+
+
+def _fetch_order_book_safe(ex, symbol):
+    """Different exchanges enforce different allowed `limit` values for order book
+    depth (KuCoin futures only accepts 20 or 1, for example). We only need the
+    top price level, so try no limit first, then fall back through common values
+    exchanges actually accept."""
+    last_exc = None
+    for limit in (None, 20, 5, 1, 50, 100):
+        try:
+            if limit is None:
+                return ex.fetch_order_book(symbol)
+            return ex.fetch_order_book(symbol, limit=limit)
+        except Exception as exc:
+            last_exc = exc
+            # only keep retrying if it's specifically a "limit" complaint —
+            # anything else (bad symbol, auth, network) should surface immediately
+            if "limit" not in str(exc).lower():
+                raise
+            continue
+    raise last_exc
 
 
 @app.route("/api/live-book")
@@ -713,6 +735,19 @@ def live_book():
     if not exchange_name or not base:
         return jsonify({"code": "error", "msg": "exchange and symbol required"}), 400
 
+    try:
+        return _live_book_impl(exchange_name, base)
+    except Exception as exc:
+        # last-resort catch-all: guarantees the browser always gets a real JSON
+        # response instead of a dropped connection ("Failed to fetch")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"code": "error",
+                        "msg": f"Unexpected server error ({type(exc).__name__}: {exc}). "
+                               f"Check the server terminal for the full traceback."}), 500
+
+
+def _live_book_impl(exchange_name, base):
     ex, err = _get_ccxt_exchange(exchange_name)
     if err:
         return jsonify({"code": "error", "msg": err})
@@ -723,9 +758,9 @@ def live_book():
             tried.append(sym)
             continue
         try:
-            book = ex.fetch_order_book(sym, limit=5)
+            book = _fetch_order_book_safe(ex, sym)
         except Exception as exc:
-            return jsonify({"code": "error", "msg": f"{exchange_name} rejected the request: {exc}", "tried": tried + [sym]})
+            return jsonify({"code": "error", "msg": f"{exchange_name} rejected the request ({type(exc).__name__}): {exc}", "tried": tried + [sym]})
         bids, asks = book.get("bids") or [], book.get("asks") or []
         if not bids or not asks:
             tried.append(sym)
@@ -2489,18 +2524,28 @@ document.addEventListener("click", e=>{
 });
 
 async function fetchLiveTopOfBook(exchange, symbol){
+  const ctrl = new AbortController();
+  const timer = setTimeout(()=>ctrl.abort(), 25000);
   try{
-    const r = await fetch(`/api/live-book?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}`);
+    const r = await fetch(`/api/live-book?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}`, {signal: ctrl.signal});
+    clearTimeout(timer);
+    if(!r.ok){
+      let bodyMsg = "";
+      try{ bodyMsg = (await r.json()).msg || ""; }catch(e){ /* body wasn't JSON */ }
+      return {code:"error", msg: `Server returned HTTP ${r.status}${bodyMsg?": "+bodyMsg:""}.`};
+    }
     return await r.json();
   }catch(e){
-    return {code:"error", msg:String(e.message)};
+    clearTimeout(timer);
+    if(e.name==="AbortError") return {code:"error", msg:"Request timed out after 25s — the server never responded (likely stuck reaching the exchange's API)."};
+    return {code:"error", msg:`Browser could not complete the request (${e.message}). This usually means the server crashed, restarted, or the connection was cut mid-response — check the server terminal/logs for the real error.`};
   }
 }
 
 function renderLiveSlot(j){
   if(String(j.code)!=="0"){
-    const msg = (j.msg||"unavailable").slice(0,90);
-    return `<span>Live top-of-book</span><b class="r-dim" title="${(j.msg||"").replace(/"/g,'&quot;')}">${msg} ⓘ</b>`;
+    const msg = j.msg || "unavailable";
+    return `<span>Live top-of-book</span><b class="r-short" style="font-weight:400;font-size:11px">${msg}</b>`;
   }
   return `<span>Live top-of-book (${j.symbol})</span>
     <b>bid ${fmtPx(j.best_bid)} / ask ${fmtPx(j.best_ask)}${j.spread_pct!=null?` · spread ${j.spread_pct.toFixed(3)}%`:""}</b>`;
