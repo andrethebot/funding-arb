@@ -7,10 +7,21 @@ Open: http://127.0.0.1:5000
 
 import bisect
 import os
+import re
 import statistics
 import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
+
+try:
+    import ccxt
+    CCXT_AVAILABLE = True
+except ImportError:
+    ccxt = None
+    CCXT_AVAILABLE = False
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
@@ -229,7 +240,7 @@ def _depth_hist(exchange, symbol, t_ms):
         try:
             r = _throttled_get("https://open-api-v4.coinglass.com/api/futures/orderbook/ask-bids-history",
                              params={"exchange": exchange, "symbol": symbol, "interval": "1h",
-                                     "range": "1", "start_time": t_ms - 6 * H,
+                                     "range": "0.25", "start_time": t_ms - 6 * H,
                                      "end_time": t_ms + H, "limit": 10},
                              headers={"accept": "application/json", "CG-API-KEY": API_KEY},
                              timeout=20)
@@ -542,9 +553,12 @@ DIAGNOSIS_TEXT = {
 def orderbook():
     exchange = request.args.get("exchange", "Binance")
     coin = request.args.get("coin") or request.args.get("symbol", "BTC")
-    rng = request.args.get("range", "1")
+    # 0.25% is the tightest band CoinGlass exposes — the closest available proxy
+    # to true top-of-book. True best-bid/ask isn't in this API at all; this band
+    # is what "no meaningful slippage in our direction" actually means here.
+    rng = request.args.get("range", "0.25")
     if rng not in ("0.25", "0.5", "0.75", "1", "2", "3", "5", "10"):
-        rng = "1"
+        rng = "0.25"
 
     key = (exchange, coin, rng)
     now = time.time()
@@ -634,6 +648,269 @@ def keepalive():
         return jsonify({"code": "0", "status": "awake", "scan_refreshed": False, "msg": data.get("msg")})
     except Exception as exc:
         return jsonify({"code": "0", "status": "awake", "scan_refreshed": False, "msg": str(exc)})
+
+
+# ======================= LIVE TOP-OF-BOOK (direct from exchanges via CCXT) =======================
+# CoinGlass gives aggregated depth within a % band. This section goes straight to each
+# exchange's own free public API for the actual best bid/ask — true top-of-book, zero
+# CoinGlass involvement. Only market-data endpoints are used; no exchange API key needed.
+
+# our display name (as CoinGlass names it) -> (ccxt class id, ccxt options)
+CCXT_MAP = {
+    "binance":  ("binance", {"options": {"defaultType": "swap"}}),
+    "bybit":    ("bybit", {"options": {"defaultType": "linear"}}),
+    "okx":      ("okx", {"options": {"defaultType": "swap"}}),
+    "gate.io":  ("gate", {"options": {"defaultType": "swap"}}),
+    "gate":     ("gate", {"options": {"defaultType": "swap"}}),
+    "kucoin":   ("kucoinfutures", {}),
+    "bitget":   ("bitget", {"options": {"defaultType": "swap"}}),
+    "kraken":   ("krakenfutures", {}),
+    "mexc":     ("mexc", {"options": {"defaultType": "swap"}}),
+    "coinex":   ("coinex", {"options": {"defaultType": "swap"}}),
+    "whitebit": ("whitebit", {}),
+    "bingx":    ("bingx", {"options": {"defaultType": "swap"}}),
+}
+
+_ccxt_instances = {}   # ccxt class id -> live exchange instance (markets loaded once, reused)
+
+
+def _get_ccxt_exchange(display_name):
+    """Return (instance, reason_if_unsupported)."""
+    if not CCXT_AVAILABLE:
+        return None, "ccxt isn't installed on the server (pip install ccxt)."
+    key = _norm(display_name)
+    entry = None
+    for k, v in CCXT_MAP.items():
+        if _norm(k) == key or key in _norm(k) or _norm(k) in key:
+            entry = v
+            break
+    if not entry:
+        return None, (f"'{display_name}' isn't in the direct-exchange map yet "
+                       f"(supported: {', '.join(sorted(set(k.title() for k in CCXT_MAP)))}).")
+    class_id, opts = entry
+    if class_id in _ccxt_instances:
+        return _ccxt_instances[class_id], None
+    try:
+        cls = getattr(ccxt, class_id)
+        ex = cls({"enableRateLimit": True, "timeout": 15000, **opts})
+        ex.load_markets()
+        _ccxt_instances[class_id] = ex
+        return ex, None
+    except Exception as exc:
+        return None, f"Couldn't connect to {display_name}'s API: {exc}"
+
+
+def _ccxt_symbol_candidates(base):
+    base = base.upper().strip()
+    # try the common unified forms across ccxt exchanges, linear USDT perp first
+    return [f"{base}/USDT:USDT", f"{base}/USDT", f"{base}/USD:USD", f"{base}/USD"]
+
+
+@app.route("/api/live-book")
+def live_book():
+    exchange_name = request.args.get("exchange", "")
+    base = request.args.get("symbol", "")
+    if not exchange_name or not base:
+        return jsonify({"code": "error", "msg": "exchange and symbol required"}), 400
+
+    ex, err = _get_ccxt_exchange(exchange_name)
+    if err:
+        return jsonify({"code": "error", "msg": err})
+
+    tried = []
+    for sym in _ccxt_symbol_candidates(base):
+        if sym not in ex.markets:
+            tried.append(sym)
+            continue
+        try:
+            book = ex.fetch_order_book(sym, limit=5)
+        except Exception as exc:
+            return jsonify({"code": "error", "msg": f"{exchange_name} rejected the request: {exc}", "tried": tried + [sym]})
+        bids, asks = book.get("bids") or [], book.get("asks") or []
+        if not bids or not asks:
+            tried.append(sym)
+            continue
+        best_bid, best_bid_qty = bids[0]
+        best_ask, best_ask_qty = asks[0]
+        mid = (best_bid + best_ask) / 2 if best_bid and best_ask else None
+        spread_pct = ((best_ask - best_bid) / mid * 100) if mid else None
+        return jsonify({
+            "code": "0", "exchange": exchange_name, "symbol": sym,
+            "best_bid": best_bid, "best_bid_qty": best_bid_qty,
+            "best_ask": best_ask, "best_ask_qty": best_ask_qty,
+            "mid": mid, "spread_pct": spread_pct,
+            "timestamp": book.get("timestamp"),
+        })
+    return jsonify({"code": "error",
+                    "msg": f"No matching market found on {exchange_name} for {base} (tried: {', '.join(tried)}).",
+                    "tried": tried})
+
+
+@app.route("/api/news")
+def api_news():
+    return jsonify(fetch_news_sentiment(request.args.get("q", "").strip()))
+
+
+BULLISH_WORDS = ["surge", "surges", "rally", "rallies", "soar", "soars", "gain", "gains",
+                 "partnership", "upgrade", "upgrades", "listing", "lists", "adoption",
+                 "breakout", "moon", "bullish", "record high", "all-time high", "ath",
+                 "approval", "approved", "integrat", "launch", "expand", "growth", "buy"]
+BEARISH_WORDS = ["crash", "crashes", "dump", "dumps", "hack", "hacked", "exploit", "lawsuit",
+                 "sec ", "delist", "delisting", "plunge", "plunges", "collapse", "rug",
+                 "investigation", "ban", "banned", "bearish", "sell-off", "selloff",
+                 "liquidat", "fraud", "scam", "warning", "probe", "halt", "sues", "sued"]
+
+
+def _score_text(text):
+    t = text.lower()
+    b = sum(1 for w in BULLISH_WORDS if w in t)
+    r = sum(1 for w in BEARISH_WORDS if w in t)
+    if b == 0 and r == 0:
+        return "neutral", 0
+    return ("bullish" if b > r else "bearish" if r > b else "mixed"), b - r
+
+
+def _age_hours(dt):
+    if dt is None:
+        return None
+    now = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (now - dt).total_seconds() / 3600
+
+
+def _fetch_rss(url, source_label, params=None, limit=40):
+    """Generic RSS fetcher — used for CoinDesk's full outbound feed."""
+    try:
+        resp = _throttled_get(url, params=params or {},
+                              headers={"User-Agent": "Mozilla/5.0 (compatible; FundingCaptureBot/1.0)"},
+                              timeout=15)
+        root = ET.fromstring(resp.content)
+        items = []
+        for item in root.findall(".//item")[:limit]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub = item.findtext("pubDate")
+            desc = re.sub("<[^<]+?>", "", item.findtext("description") or "")[:200]
+            dt = None
+            try:
+                dt = parsedate_to_datetime(pub) if pub else None
+            except Exception:
+                dt = None
+            sentiment, score = _score_text(title + " " + desc)
+            items.append({"title": title, "link": link, "source": source_label,
+                         "published": pub, "age_hours": _age_hours(dt),
+                         "sentiment": sentiment, "score": score, "desc": desc})
+        return items, None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _fetch_coindesk_headlines(query, limit=60):
+    """CoinDesk's feed is a general firehose, not per-coin searchable — pull it
+    and keep only items whose title/description mention the query."""
+    items, err = _fetch_rss("https://www.coindesk.com/arc/outboundfeeds/rss/", "CoinDesk", limit=limit)
+    if err:
+        return [], err
+    q = query.lower()
+    q_terms = [q] + ([q[:-1]] if q.endswith("s") and len(q) > 3 else [])
+    matched = [x for x in items if any(t in (x["title"] + " " + x["desc"]).lower() for t in q_terms)]
+    return matched, None
+
+
+def _fetch_google_news(query, limit=20):
+    try:
+        resp = _throttled_get(
+            "https://news.google.com/rss/search",
+            params={"q": f"{query} crypto", "hl": "en-US", "gl": "US", "ceid": "US:en"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; FundingCaptureBot/1.0)"},
+            timeout=15)
+        root = ET.fromstring(resp.content)
+        items = []
+        for item in root.findall(".//item")[:limit]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub = item.findtext("pubDate")
+            source_el = item.find("{http://www.google.com/rss/source}source") \
+                if item.find("{http://www.google.com/rss/source}source") is not None \
+                else item.find("source")
+            source = (source_el.text if source_el is not None else "") or ""
+            dt = None
+            try:
+                dt = parsedate_to_datetime(pub) if pub else None
+            except Exception:
+                dt = None
+            sentiment, score = _score_text(title)
+            items.append({"title": title, "link": link, "source": source,
+                         "published": pub, "age_hours": _age_hours(dt),
+                         "sentiment": sentiment, "score": score})
+        return items, None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def _fetch_reddit(query, limit=15):
+    try:
+        resp = _throttled_get(
+            "https://www.reddit.com/search.json",
+            params={"q": query, "sort": "new", "limit": limit, "t": "week"},
+            headers={"User-Agent": "FundingCaptureBot/1.0 (personal dashboard)"},
+            timeout=15)
+        if resp.status_code != 200:
+            return [], f"Reddit returned HTTP {resp.status_code} (may be rate-limited)"
+        data = resp.json()
+        q = query.lower()
+        q_terms = [q] + ([q[:-1]] if q.endswith("s") and len(q) > 3 else [])
+        items = []
+        for child in data.get("data", {}).get("children", []):
+            p = child.get("data", {})
+            title = p.get("title", "")
+            body = p.get("selftext", "")[:300]
+            # keep only posts that actually mention the coin — Reddit's own
+            # search can surface loosely related results otherwise
+            if not any(t in (title + " " + body).lower() for t in q_terms):
+                continue
+            created = p.get("created_utc")
+            dt = datetime.fromtimestamp(created, tz=timezone.utc) if created else None
+            sentiment, score = _score_text(title + " " + body[:200])
+            items.append({"title": title, "link": "https://reddit.com" + p.get("permalink", ""),
+                         "subreddit": p.get("subreddit", ""), "ups": p.get("ups", 0),
+                         "comments": p.get("num_comments", 0), "age_hours": _age_hours(dt),
+                         "sentiment": sentiment, "score": score})
+        return items, None
+    except Exception as exc:
+        return [], str(exc)
+
+
+def fetch_news_sentiment(query):
+    if not query:
+        return {"code": "error", "msg": "symbol/query required"}
+    headlines, headlines_err = _fetch_coindesk_headlines(query)
+    news, news_err = _fetch_google_news(query)
+    reddit, reddit_err = _fetch_reddit(query)
+    all_items = headlines + news + reddit
+    recent24 = [x for x in all_items if x["age_hours"] is not None and x["age_hours"] <= 24]
+    recent7d = [x for x in all_items if x["age_hours"] is not None and x["age_hours"] <= 168]
+    total_score = sum(x["score"] for x in all_items)
+    bull = sum(1 for x in all_items if x["sentiment"] == "bullish")
+    bear = sum(1 for x in all_items if x["sentiment"] == "bearish")
+    if bull > bear * 1.3:
+        overall = "bullish"
+    elif bear > bull * 1.3:
+        overall = "bearish"
+    elif bull or bear:
+        overall = "mixed"
+    else:
+        overall = "neutral"
+    return {"code": "0", "query": query,
+           "headlines": sorted(headlines, key=lambda x: x["age_hours"] if x["age_hours"] is not None else 9999),
+           "headlines_error": headlines_err,
+           "news": sorted(news, key=lambda x: x["age_hours"] if x["age_hours"] is not None else 9999),
+           "reddit": sorted(reddit, key=lambda x: x["age_hours"] if x["age_hours"] is not None else 9999),
+           "news_error": news_err, "reddit_error": reddit_err,
+           "summary": {"total_items": len(all_items), "items_24h": len(recent24),
+                       "items_7d": len(recent7d), "bullish_count": bull, "bearish_count": bear,
+                       "overall": overall, "net_score": total_score}}
 
 
 @app.route("/")
@@ -773,6 +1050,26 @@ PAGE = r"""<!DOCTYPE html>
   .dtag.ok{color:var(--long);background:var(--long-dim)}
   .dtag.mid{color:var(--gold);background:var(--gold-dim)}
   .dtag.bad{color:var(--short);background:var(--short-dim)}
+  .dtag.unk-tag{color:var(--faint);background:var(--panel-2)}
+  .derrdetail{margin-top:6px;font-size:10px}
+  .derrdetail summary{color:var(--faint);cursor:pointer}
+  .derrdetail .derr{display:block;margin-top:4px;color:var(--faint);overflow-wrap:anywhere}
+
+  /* ---- 3-box leg summary (long / short / recommendation) ---- */
+  .legrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:14px}
+  @media(max-width:900px){.legrid{grid-template-columns:1fr}}
+  .legbox{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:14px 16px}
+  .legbox.lg-long{border-top:3px solid var(--long)}
+  .legbox.lg-short{border-top:3px solid var(--short)}
+  .legbox.lg-rec{border-top:3px solid var(--gold);background:var(--panel-2)}
+  .lghead{font-family:var(--disp);font-weight:700;font-size:12px;letter-spacing:.04em;margin-bottom:10px;
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .lgrow{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:6px 0;border-top:1px solid var(--edge);font-size:12px}
+  .lgrow:first-of-type{border-top:0}
+  .lgrow span{color:var(--muted);flex:0 0 auto;white-space:nowrap}
+  .lgrow b{color:var(--text);text-align:right;flex:1 1 auto;min-width:0;white-space:normal;overflow-wrap:break-word}
+  .lgrow.lg-live{border-top:1px dashed var(--gold);margin-top:4px;padding-top:8px}
+  .lgrow.lg-live span{color:var(--gold)}
   .drow{display:flex;justify-content:space-between;gap:10px;padding:3px 0;font-size:12px}
   .drow span{color:var(--muted)}
   .dbar{height:6px;border-radius:3px;background:var(--short-dim);overflow:hidden;margin:8px 0 4px}
@@ -874,6 +1171,25 @@ PAGE = r"""<!DOCTYPE html>
   .flowarrow{flex:0 0 40px;text-align:center;color:var(--gold);font-size:18px}
   .flowcard .fttl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);margin-bottom:6px}
   .flowcard .fval{font-size:16px;font-weight:600}
+
+  /* ---- news & sentiment ---- */
+  .sentbadge{display:inline-block;font-size:11px;font-weight:700;padding:3px 10px;border-radius:5px;letter-spacing:.04em}
+  .sentbadge.bullish{color:var(--long);background:var(--long-dim)}
+  .sentbadge.bearish{color:var(--short);background:var(--short-dim)}
+  .sentbadge.mixed{color:var(--gold);background:var(--gold-dim)}
+  .sentbadge.neutral{color:var(--faint);background:var(--panel-2)}
+  .newsitem{display:flex;gap:12px;align-items:flex-start;padding:11px 0;border-top:1px solid var(--edge)}
+  .newsitem:first-child{border-top:0}
+  .newsitem .nmeta{flex:0 0 82px;font-size:10px;color:var(--faint);line-height:1.6}
+  .newsitem .nbody{flex:1;min-width:0}
+  .newsitem .ntitle{font-size:12.5px;color:var(--text);line-height:1.5}
+  .newsitem .ntitle a{color:inherit;text-decoration:none}
+  .newsitem .ntitle a:hover{text-decoration:underline}
+  .newsitem .nsource{font-size:10px;color:var(--muted);margin-top:3px}
+  .spikebadge{font-size:10px;font-weight:700;letter-spacing:.06em;padding:3px 8px;border-radius:4px;
+    color:var(--gold);background:var(--gold-dim);margin-left:8px}
+  .btpanel.headlines{border-left:3px solid var(--gold);background:var(--panel-2)}
+  .newsitem.headline .ntitle{font-family:var(--disp);font-weight:500}
   tr.browrank{cursor:pointer}
   tr.browdetail td{background:var(--panel-2);white-space:normal;overflow-wrap:anywhere}
   .browdetailwrap{padding:10px 14px;display:flex;flex-direction:column;gap:6px}
@@ -898,6 +1214,13 @@ PAGE = r"""<!DOCTYPE html>
   .pagearea{flex:1;min-width:0}
   .page{display:none}
   .page.active{display:block}
+  .subpage{display:none}
+  .subpage.active{display:block}
+  .subnavbar{display:flex;gap:8px;border-bottom:1px solid var(--edge);padding-bottom:16px;margin-bottom:4px}
+  .subnavbtn{background:transparent;border:1px solid var(--edge);color:var(--muted);font-family:var(--disp);
+    font-weight:600;font-size:12px;padding:9px 16px;border-radius:6px;cursor:pointer}
+  .subnavbtn:hover{color:var(--text)}
+  .subnavbtn.active{color:var(--gold);border-color:var(--gold);background:var(--gold-dim)}
   @media(max-width:820px){
     .applayout{flex-direction:column}
     .sidenav{width:100%;flex:none;height:auto;position:relative;padding:10px 0;
@@ -923,8 +1246,8 @@ PAGE = r"""<!DOCTYPE html>
   <div class="navitem" data-page="page-backtest"><span class="navnum">02</span>Run Backtest</div>
   <div class="navitem" data-page="page-history"><span class="navnum">03</span>Coin Research</div>
   <div class="navitem" data-page="page-calc"><span class="navnum">04</span>Profit Calculator</div>
-  <div class="navitem" data-page="page-explain"><span class="navnum">05</span>How This Trade Works</div>
-  <div class="navitem" data-page="page-btexplain"><span class="navnum">06</span>How Backtesting Works</div>
+  <div class="navitem" data-page="page-news"><span class="navnum">05</span>News &amp; Sentiment</div>
+  <div class="navitem" data-page="page-guides"><span class="navnum">06</span>Guides</div>
 </nav>
 <div class="pagearea">
 
@@ -1044,7 +1367,21 @@ PAGE = r"""<!DOCTYPE html>
 </main>
 </div>
 
-<div class="page" id="page-explain">
+<div class="page" id="page-guides">
+<header style="border-bottom:1px solid var(--edge);padding:28px 32px 20px">
+  <div class="brand">
+    <h1>GUIDES</h1>
+    <p>Plain-language explainers — how the trade works, and how the backtest reads history.</p>
+  </div>
+</header>
+<div style="padding:20px 32px 0;max-width:900px;margin:0 auto">
+  <div class="subnavbar">
+    <button class="subnavbtn active" data-sub="sub-explain">How This Trade Works</button>
+    <button class="subnavbtn" data-sub="sub-btexplain">How Backtesting Works</button>
+  </div>
+</div>
+
+<div class="subpage active" id="sub-explain">
   <header style="border-bottom:1px solid var(--edge);padding:28px 32px 20px">
   <div class="brand">
     <h1>HOW THIS <span>TRADE</span> WORKS</h1>
@@ -1123,60 +1460,9 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 
 </main>
-</div>
+</div><!-- /sub-explain -->
 
-<div class="page" id="page-calc">
-<header style="border-bottom:1px solid var(--edge);padding:28px 32px 20px">
-  <div class="brand">
-    <h1>PROFIT <span>CALCULATOR</span></h1>
-    <p>Every line of the math shown explicitly — funding on each leg, the price-gap trade, fees, and what's left over.</p>
-  </div>
-</header>
-<main style="padding:20px 32px 70px;max-width:1280px;margin:0 auto">
-
-  <div class="controls" style="gap:10px;margin-bottom:16px">
-    <div class="ctl"><label for="cPick">Load a live pair</label>
-      <select id="cPick" style="width:260px"><option value="">— manual entry —</option></select></div>
-    <div class="ctl"><label>&nbsp;</label><button id="cFetchPx" class="ghost">📡 Fetch live prices &amp; OI for this pair</button></div>
-    <div class="ctl"><label>&nbsp;</label><span id="cFetchStatus" class="dsub"></span></div>
-  </div>
-
-  <div class="calcgrid">
-    <div class="btpanel">
-      <div class="pxlabel" style="margin-bottom:10px">1 · POSITION &amp; LEVERAGE</div>
-      <div class="cfield"><label>Symbol</label><input id="cSym" value="COIN"></div>
-      <div class="cfield"><label>Position size per leg (USD)</label><input id="cUsd" type="number" value="10000" step="500"></div>
-      <div class="cfield"><label>Leverage per leg</label><input id="cLev" type="number" value="3" min="1" step="1"></div>
-
-      <div class="pxlabel" style="margin:16px 0 10px">2 · FUNDING RATES</div>
-      <div class="cfield"><label>Long venue name</label><input id="cLongEx" value="Exchange A"></div>
-      <div class="cfield"><label>Long funding rate (%/settlement)</label><input id="cLongRate" type="number" value="-0.50" step="0.01"></div>
-      <div class="cfield"><label>Long settles every (hours)</label><input id="cLongInt" type="number" value="4" min="1" step="1"></div>
-      <div class="cfield"><label>Short venue name</label><input id="cShortEx" value="Exchange B"></div>
-      <div class="cfield"><label>Short funding rate (%/settlement)</label><input id="cShortRate" type="number" value="0.02" step="0.01"></div>
-      <div class="cfield"><label>Short settles every (hours)</label><input id="cShortInt" type="number" value="8" min="1" step="1"></div>
-
-      <div class="pxlabel" style="margin:16px 0 10px">3 · PRICES — FUTURES (per venue) &amp; UNDERLYING/INDEX</div>
-      <div class="cfield"><label>Long price at entry</label><input id="cPxLE" type="number" value="1.0000" step="0.0001"></div>
-      <div class="cfield"><label>Short price at entry</label><input id="cPxSE" type="number" value="1.0000" step="0.0001"></div>
-      <div class="cfield"><label>Index/spot price at entry</label><input id="cPxIE" type="number" value="1.0000" step="0.0001"></div>
-      <div class="cfield"><label>Long price at exit</label><input id="cPxLX" type="number" value="1.0000" step="0.0001"></div>
-      <div class="cfield"><label>Short price at exit</label><input id="cPxSX" type="number" value="1.0000" step="0.0001"></div>
-      <div class="cfield"><label>Index/spot price at exit</label><input id="cPxIX" type="number" value="1.0000" step="0.0001"></div>
-      <div class="cfield"><label>Long venue open interest (USD)</label><input id="cOiL" type="number" value="" placeholder="auto or manual"></div>
-      <div class="cfield"><label>Short venue open interest (USD)</label><input id="cOiS" type="number" value="" placeholder="auto or manual"></div>
-
-      <div class="pxlabel" style="margin:16px 0 10px">4 · HOLD &amp; COSTS</div>
-      <div class="cfield"><label>Hold duration (hours)</label><input id="cHold" type="number" value="24" min="1" step="1"></div>
-      <div class="cfield"><label>Round-trip fee, both legs (%)</label><input id="cFee" type="number" value="0.12" step="0.01"></div>
-    </div>
-
-    <div id="cOut"></div>
-  </div>
-</main>
-</div><!-- /page-calc -->
-
-<div class="page" id="page-btexplain">
+<div class="subpage" id="sub-btexplain">
 <header style="border-bottom:1px solid var(--edge);padding:28px 32px 20px">
   <div class="brand">
     <h1>HOW <span>BACKTESTING</span> WORKS</h1>
@@ -1309,7 +1595,82 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 
 </main>
-</div><!-- /page-btexplain -->
+</div><!-- /sub-btexplain -->
+
+</div><!-- /page-guides -->
+
+<div class="page" id="page-calc">
+<header style="border-bottom:1px solid var(--edge);padding:28px 32px 20px">
+  <div class="brand">
+    <h1>PROFIT <span>CALCULATOR</span></h1>
+    <p>Every line of the math shown explicitly — funding on each leg, the price-gap trade, fees, and what's left over.</p>
+  </div>
+</header>
+<main style="padding:20px 32px 70px;max-width:1280px;margin:0 auto">
+
+  <div class="controls" style="gap:10px;margin-bottom:16px">
+    <div class="ctl"><label for="cPick">Load a live pair</label>
+      <select id="cPick" style="width:260px"><option value="">— manual entry —</option></select></div>
+    <div class="ctl"><label>&nbsp;</label><button id="cFetchPx" class="ghost">📡 Fetch live prices &amp; OI for this pair</button></div>
+    <div class="ctl"><label>&nbsp;</label><span id="cFetchStatus" class="dsub"></span></div>
+  </div>
+
+  <div class="calcgrid">
+    <div class="btpanel">
+      <div class="pxlabel" style="margin-bottom:10px">1 · POSITION &amp; LEVERAGE</div>
+      <div class="cfield"><label>Symbol</label><input id="cSym" value="COIN"></div>
+      <div class="cfield"><label>Position size per leg (USD)</label><input id="cUsd" type="number" value="10000" step="500"></div>
+      <div class="cfield"><label>Leverage per leg</label><input id="cLev" type="number" value="3" min="1" step="1"></div>
+
+      <div class="pxlabel" style="margin:16px 0 10px">2 · FUNDING RATES</div>
+      <div class="cfield"><label>Long venue name</label><input id="cLongEx" value="Exchange A"></div>
+      <div class="cfield"><label>Long funding rate (%/settlement)</label><input id="cLongRate" type="number" value="-0.50" step="0.01"></div>
+      <div class="cfield"><label>Long settles every (hours)</label><input id="cLongInt" type="number" value="4" min="1" step="1"></div>
+      <div class="cfield"><label>Short venue name</label><input id="cShortEx" value="Exchange B"></div>
+      <div class="cfield"><label>Short funding rate (%/settlement)</label><input id="cShortRate" type="number" value="0.02" step="0.01"></div>
+      <div class="cfield"><label>Short settles every (hours)</label><input id="cShortInt" type="number" value="8" min="1" step="1"></div>
+
+      <div class="pxlabel" style="margin:16px 0 10px">3 · PRICES — FUTURES (per venue) &amp; UNDERLYING/INDEX</div>
+      <div class="cfield"><label>Long price at entry</label><input id="cPxLE" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Short price at entry</label><input id="cPxSE" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Index/spot price at entry</label><input id="cPxIE" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Long price at exit</label><input id="cPxLX" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Short price at exit</label><input id="cPxSX" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Index/spot price at exit</label><input id="cPxIX" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Long venue open interest (USD)</label><input id="cOiL" type="number" value="" placeholder="auto or manual"></div>
+      <div class="cfield"><label>Short venue open interest (USD)</label><input id="cOiS" type="number" value="" placeholder="auto or manual"></div>
+
+      <div class="pxlabel" style="margin:16px 0 10px">4 · HOLD &amp; COSTS</div>
+      <div class="cfield"><label>Hold duration (hours)</label><input id="cHold" type="number" value="24" min="1" step="1"></div>
+      <div class="cfield"><label>Round-trip fee, both legs (%)</label><input id="cFee" type="number" value="0.12" step="0.01"></div>
+
+      <div class="pxlabel" style="margin:16px 0 10px">5 · POSITION SIZING CHECK (optional)</div>
+      <div class="dsub" style="margin-bottom:8px">Order book depth for the recommended-size check. Filled automatically by "Fetch live prices &amp; OI" above, or enter manually.</div>
+      <div class="cfield"><label>Long book depth, asks (USD)</label><input id="cDepthL" type="number" value="0" step="1000"></div>
+      <div class="cfield"><label>Short book depth, bids (USD)</label><input id="cDepthS" type="number" value="0" step="1000"></div>
+    </div>
+
+    <div id="cOut"></div>
+  </div>
+</main>
+</div><!-- /page-calc -->
+
+<div class="page" id="page-news">
+<header style="border-bottom:1px solid var(--edge);padding:28px 32px 20px">
+  <div class="brand">
+    <h1>NEWS &amp; <span>SENTIMENT</span></h1>
+    <p>Free sources only — Google News headlines and Reddit discussion, scored with a simple keyword heuristic. Not X/Twitter (that API has no free tier as of 2026).</p>
+  </div>
+</header>
+<main style="padding:20px 32px 70px;max-width:1100px;margin:0 auto">
+  <div class="controls" style="gap:10px;margin-bottom:16px">
+    <div class="ctl"><label for="nSym">Coin name</label><input id="nSym" placeholder="Bitcoin, SUPRA, Ethereum…" style="width:220px"></div>
+    <div class="ctl"><label>&nbsp;</label><button id="nSearch">🔍 Search</button></div>
+  </div>
+  <div id="nOut"><div class="empty">Type a coin name (works best as the full name, e.g. "Bitcoin" rather than just "BTC") and press Search.<br>
+    Pulls recent Google News headlines and Reddit posts mentioning it, tags each bullish/bearish by keyword, and flags any 24h news spike.</div></div>
+</main>
+</div><!-- /page-news -->
 
 </div><!-- /pagearea -->
 </div><!-- /applayout -->
@@ -1712,6 +2073,57 @@ function priceStrip(d, px){
   </div>`;
 }
 
+// ---- shared: recommended max position from depth + OI (two independent caps, take the smaller) ----
+const SIZE_K1 = 5;      // depth cap: position <= book/K1 (i.e. <=20% of visible ±0.25% top-of-book depth)
+const SIZE_P  = 0.015;  // OI cap: position <= P% of open interest (footprint / rate-impact limit)
+
+function recommendSize(depthL, depthS, hasDepth, oiL, oiS){
+  const hasOI = oiL!=null && oiS!=null && oiL>0 && oiS>0;
+  const sizeDepth = hasDepth ? Math.min(depthL, depthS)/SIZE_K1 : null;
+  const sizeOI = hasOI ? Math.min(oiL, oiS)*SIZE_P : null;
+  const cands = [sizeDepth, sizeOI].filter(x=>x!=null && x>0);
+  const rec = cands.length ? Math.min(...cands) : null;
+  let binding = null;
+  if(rec!=null){ binding = (sizeDepth!=null && Math.abs(rec-sizeDepth)<1e-6) ? "order book depth" : "open interest (footprint)"; }
+  // fragility flag: OI far exceeds depth -> "phantom liquidity", standing size on a thin book
+  const ratioL = (hasDepth && oiL) ? oiL/Math.max(depthL,1) : null;
+  const ratioS = (hasDepth && oiS) ? oiS/Math.max(depthS,1) : null;
+  const fragile = (ratioL && ratioL>50) || (ratioS && ratioS>50);
+  return {sizeDepth, sizeOI, rec, binding, hasDepth, hasOI, fragile, ratioL, ratioS};
+}
+
+function recCard(sz, currentUsd){
+  if(sz.rec==null){
+    return `<div class="dleg" style="border-left:3px solid var(--faint)">
+      <div class="dhead">RECOMMENDED MAX POSITION <span class="dtag unk-tag">NOT ENOUGH DATA</span></div>
+      <div class="dna">Need both order book depth and open interest on both legs to compute this. Check the L/S/P data badges above.</div></div>`;
+  }
+  const over = currentUsd > sz.rec;
+  return `<div class="dleg" style="border-left:3px solid ${over?'var(--short)':'var(--long)'}">
+    <div class="dhead">RECOMMENDED MAX POSITION <span class="dtag ${over?'bad':'ok'}">${fmt$(sz.rec)}</span></div>
+    <div class="drow"><span>Cap 1 — book depth ÷ ${SIZE_K1} (stay ≤${Math.round(100/SIZE_K1)}% of visible book)</span><b>${sz.sizeDepth!=null?fmt$(sz.sizeDepth):"—"}</b></div>
+    <div class="drow"><span>Cap 2 — ${(SIZE_P*100).toFixed(1)}% of open interest (footprint/rate-impact limit)</span><b>${sz.sizeOI!=null?fmt$(sz.sizeOI):"—"}</b></div>
+    <div class="drow"><span>Binding constraint</span><b>${sz.binding||"—"}</b></div>
+    <div class="drow"><span>Your current position</span><b class="${over?'r-short':'r-long'}">${fmt$(currentUsd)} ${over?"— ABOVE recommendation":"— within recommendation"}</b></div>
+    ${sz.fragile?'<div class="dsub" style="color:var(--gold);margin-top:6px">⚠ Open interest is much larger than resting book depth on at least one leg — standing size sits on a thin book ("phantom liquidity"). Treat the recommendation above as optimistic; consider sizing smaller.</div>':""}
+  </div>`;
+}
+
+function friendlyDepthError(raw){
+  if(!raw) return null;
+  const r = String(raw).toLowerCase();
+  if(r.includes("tried:") || r.includes("no orderbook") || r.includes("no_data"))
+    return "CoinGlass doesn't track the order book for this pair on this exchange.";
+  if(r.includes("plan") || r.includes("permission") || r.includes("upgrade") || r.includes("403"))
+    return "This data needs a higher CoinGlass API plan tier.";
+  if(r.includes("network") || r.includes("timeout") || r.includes("timed out"))
+    return "Couldn't reach CoinGlass (network issue) — try again in a moment.";
+  if(r.includes("endpoint not found") || r.includes("404"))
+    return "CoinGlass doesn't have this endpoint for this exchange.";
+  return "Couldn't load this data.";
+}
+
+
 function coverageTag(mult){
   if(mult>=20) return ['ok','DEEP ×'+mult.toFixed(0)];
   if(mult>=5)  return ['mid','OK ×'+mult.toFixed(1)];
@@ -1730,77 +2142,131 @@ function volProxyTag(volUsd){
 
 function depthLeg(title, cls, exchange, action, sideLabel, sideUsd, sideQty, otherLabel, otherUsd, ob, mkt){
   if(!ob || !ob.latest){
-    let err = ob && ob.error ? String(ob.error) : "";
-    if(err.length>160) err = err.slice(0,160)+"…";
+    const rawErr = ob && ob.error ? String(ob.error) : "";
+    const friendly = friendlyDepthError(rawErr) || "No order book data for this venue.";
     const vol = mkt && mkt.volume_usd;
     if(vol){
       const [tagCls, tagTxt] = volProxyTag(vol);
       return `<div class="dleg ${cls}">
       <div class="dhead">${title} · ${exchange} <span class="dtag ${tagCls}">${tagTxt}</span></div>
-      <div class="drow"><span>Book not tracked by CoinGlass — falling back to volume</span></div>
+      <div class="dna"><b style="color:var(--text)">${friendly}</b><br>Falling back to 24h trading volume as a rough substitute.</div>
       <div class="drow"><span>24h volume</span><b>${oiShort(vol)}</b></div>
       <div class="drow"><span>your order vs daily flow</span><b>${(lastUsd/vol*100).toFixed(3)}%</b></div>
-      <div class="dsub">Volume is a weaker signal than book depth: it says the pair trades actively,
-      not that resting liquidity exists at your moment of execution. Use limit orders and verify the
-      live book on ${exchange} before firing.${err?`<div class="derr">${err}</div>`:""}</div></div>`;
+      <div class="dsub">Volume only shows the pair trades actively — not that liquidity is resting in the book right now. Use limit orders and check the live book on ${exchange} before firing.
+      ${rawErr?`<details class="derrdetail"><summary>technical details</summary><span class="derr">${rawErr}</span></details>`:""}</div></div>`;
     }
     return `<div class="dleg ${cls}">
     <div class="dhead">${title} · ${exchange} <span class="dtag bad">NO DATA</span></div>
-    <div class="dna">No orderbook depth and no volume data for this pair on this venue —
-    a serious liquidity red flag. Treat as not executable at size.
-    ${err?`<div class="derr">${err}</div>`:""}</div></div>`;
+    <div class="dna"><b style="color:var(--text)">${friendly}</b><br>No volume fallback either — this is a real liquidity blind spot. Treat this leg as not executable until you check the exchange directly.
+    ${rawErr?`<details class="derrdetail"><summary>technical details</summary><span class="derr">${rawErr}</span></details>`:""}</div></div>`;
   }
   const t = new Date(ob.latest.time).toLocaleString();
   const mult = sideUsd>0 ? sideUsd/lastUsd : 0;
   const [tagCls, tagTxt] = coverageTag(mult);
   const total = sideUsd + otherUsd;
   const imb = total>0 ? (ob.latest.bids_usd/total*100) : 50;
+  const oi = mkt && mkt.oi_usd;
   return `<div class="dleg ${cls}">
     <div class="dhead">${title} · ${exchange} <span class="dtag ${tagCls}">${tagTxt}</span></div>
     <div class="drow"><span>${action} — you consume <b>${sideLabel}</b></span><b>${oiShort(sideUsd)}</b></div>
     <div class="drow"><span>${sideLabel} quantity</span><b>${Number(sideQty).toLocaleString()}</b></div>
     <div class="drow"><span>${otherLabel} (other side)</span><b>${oiShort(otherUsd)}</b></div>
+    ${oi?`<div class="drow"><span>Open interest (standing size)</span><b>${oiShort(oi)}</b></div>`:""}
     <div class="dbar"><i style="width:${imb.toFixed(1)}%"></i></div>
     <div class="dsub">instrument ${ob.pair||"?"} · bids ${imb.toFixed(0)}% / asks ${(100-imb).toFixed(0)}% · snapshot ${t} (${ob.interval})</div>
   </div>`;
 }
 
+// One consistent box for a leg: funding, price, 24h vol, OI, depth in the direction we'd trade.
+// Each metric falls back to "—" independently rather than blanking the whole box,
+// since funding always comes from the scan and price/OI/depth are separate fetches
+// that can each succeed or fail on their own.
+function legBox(title, cls, exchange, symbol, fundingRate, fundingInterval, action, sideLabel,
+                ob, sideUsd, hasOb, mkt){
+  const mult = hasOb && sideUsd>0 ? sideUsd/lastUsd : 0;
+  let tagCls="unk-tag", tagTxt="NO DATA";
+  if(hasOb){ [tagCls, tagTxt] = coverageTag(mult); }
+  else if(mkt && mkt.volume_usd){ [tagCls, tagTxt] = volProxyTag(mkt.volume_usd); }
+
+  let depthRow;
+  if(hasOb){
+    depthRow = `<div class="lgrow"><span>${action} depth (${sideLabel})</span><b>${oiShort(sideUsd)}</b></div>`;
+  } else {
+    const full = friendlyDepthError(ob&&ob.error) || "No order book data for this venue.";
+    depthRow = `<div class="lgrow"><span>${action} depth (${sideLabel})</span>
+      <b class="r-dim" title="${full.replace(/"/g,'&quot;')}">not tracked ⓘ</b></div>`;
+  }
+
+  return `<div class="legbox ${cls}">
+    <div class="lghead">${title} · ${exchange} <span class="dtag ${tagCls}">${tagTxt}</span></div>
+    <div class="lgrow"><span>Funding rate</span><b class="${fundingRate>=0?'r-short':'r-long'}">${fmtPct4?fmtPct4(fundingRate):fundingRate+'%'} / ${fundingInterval}h</b></div>
+    <div class="lgrow"><span>Price</span><b>${mkt&&mkt.price!=null?fmtPx(mkt.price):"—"}</b></div>
+    <div class="lgrow"><span>24h volume</span><b>${mkt&&mkt.volume_usd!=null?oiShort(mkt.volume_usd):"—"}</b></div>
+    <div class="lgrow"><span>Open interest</span><b>${mkt&&mkt.oi_usd!=null?oiShort(mkt.oi_usd):"—"}</b></div>
+    ${depthRow}
+    ${!hasOb?`<div class="dsub" style="margin-top:8px">${friendlyDepthError(ob&&ob.error) || "No order book data for this venue."}</div>`:""}
+    <div class="lgrow lg-live" id="live-${cls}-${symbol}"><span>Live top-of-book</span><b class="r-dim">not fetched — click below</b></div>
+  </div>`;
+}
+
 function depthPanel(d, longOb, shortOb, px){
-  const hasL = longOb && longOb.latest, hasS = shortOb && shortOb.latest;
-  const okL = hasL ? longOb.latest.asks_usd/lastUsd : 0;
-  const okS = hasS ? shortOb.latest.bids_usd/lastUsd : 0;
+  const hasL = !!(longOb && longOb.latest), hasS = !!(shortOb && shortOb.latest);
+  const depthL = hasL ? longOb.latest.asks_usd : 0;
+  const depthS = hasS ? shortOb.latest.bids_usd : 0;
+  const okL = hasL ? depthL/lastUsd : 0;
+  const okS = hasS ? depthS/lastUsd : 0;
   const mktL = px && px.long ? px.long : null;
   const mktS = px && px.short ? px.short : null;
-  // is a missing-book leg rescued by a strong volume proxy?
   const proxyOK = leg => leg && leg.volume_usd && leg.volume_usd >= lastUsd*500;
   const worst = Math.min(hasL?okL:Infinity, hasS?okS:Infinity);
-  let verdict, vcls;
+
+  let verdict, vcls, reason;
   if(hasL && hasS){
-    if(worst>=20){ verdict="EXECUTABLE — both books ≥20× your size within ±1% of mid"; vcls="ok"; }
-    else if(worst>=5){ verdict="MARGINAL — expect some slippage, consider splitting the order"; vcls="mid"; }
-    else { verdict="NOT EXECUTABLE AT SIZE — thinnest book under 5× your position"; vcls="bad"; }
+    if(worst>=20){ verdict="EXECUTABLE"; vcls="ok"; reason="Both venues have top-of-book depth comfortably covering your position — minimal slippage expected."; }
+    else if(worst>=5){ verdict="CAUTION"; vcls="mid"; reason="Enough depth to fill, but expect some slippage — consider splitting the order."; }
+    else { verdict="NOT SAFE AT THIS SIZE"; vcls="bad"; reason="At least one book is too thin — shrink your position or skip this pair."; }
   } else {
     const missOK = (hasL || proxyOK(mktL)) && (hasS || proxyOK(mktS));
     const trackedBad = (hasL && okL<5) || (hasS && okS<5);
-    if(missOK && !trackedBad){
-      verdict="PROXY ONLY — book untracked on one leg; 24h volume looks sufficient, verify the live book before firing"; vcls="mid";
-    } else {
-      verdict="UNVERIFIED — missing depth and weak volume on at least one leg"; vcls="bad";
-    }
+    if(missOK && !trackedBad){ verdict="CAUTION — UNVERIFIED"; vcls="mid"; reason="Order book missing on one leg; trading volume looks sufficient but isn't a guarantee. Check the live book before firing."; }
+    else { verdict="UNKNOWN — CAN'T VERIFY"; vcls="bad"; reason="Missing order book data and weak/no volume on at least one leg. Treat as not safe until you check manually."; }
   }
+
+  const sz = recommendSize(depthL, depthS, hasL&&hasS, mktL&&mktL.oi_usd, mktS&&mktS.oi_usd);
+
+  // price-gap read, folded into the recommendation box instead of a separate strip
+  let gapLine = `<div class="lgrow"><span>Price gap (long vs short)</span><b class="r-dim">no price data</b></div>`;
+  if(mktL && mktS && mktL.price!=null && mktS.price!=null){
+    const mid = (mktL.price + mktS.price)/2;
+    const gap = mid ? (mktS.price - mktL.price)/mid*100 : 0;
+    gapLine = `<div class="lgrow"><span>Price gap (short − long)</span>
+      <b class="${gap>=0?'r-long':'r-apr'}">${(gap>=0?"+":"")+gap.toFixed(3)}% ${gap>=0?"(favorable entry)":"(you buy the pricier side)"}</b></div>`;
+  }
+
   return `
   <div class="depthwrap">
-    <div class="dverdict ${vcls}">${verdict} <span>· position ${fmt$(lastUsd)}/leg</span></div>
-    ${priceStrip(d, px)}
-    <div class="dgrid">
-      ${depthLeg("LONG LEG","dl", d.buy.exchange, "BUY "+d.symbol, "asks",
-        hasL?longOb.latest.asks_usd:0, hasL?longOb.latest.asks_quantity:0,
-        "bids", hasL?longOb.latest.bids_usd:0, longOb, mktL)}
-      ${depthLeg("SHORT LEG","ds", d.sell.exchange, "SELL "+d.symbol, "bids",
-        hasS?shortOb.latest.bids_usd:0, hasS?shortOb.latest.bids_quantity:0,
-        "asks", hasS?shortOb.latest.asks_usd:0, shortOb, mktS)}
+    <div class="legrid">
+      ${legBox("LONG LEG","lg-long", d.buy.exchange, d.symbol, d.buy.funding_rate, d.buy.funding_rate_interval,
+        "Buy", "asks", longOb, depthL, hasL, mktL)}
+      ${legBox("SHORT LEG","lg-short", d.sell.exchange, d.symbol, d.sell.funding_rate, d.sell.funding_rate_interval,
+        "Sell", "bids", shortOb, depthS, hasS, mktS)}
+      <div class="legbox lg-rec">
+        <div class="lghead">RECOMMENDATION</div>
+        <div class="dverdict ${vcls}" style="margin:0 0 6px">${verdict}</div>
+        <div class="dsub" style="margin-bottom:10px">${reason}</div>
+        ${gapLine}
+        <div class="lgrow"><span>Recommended max position</span>
+          <b class="${sz.rec!=null && lastUsd>sz.rec?'r-short':'r-long'}">${sz.rec!=null?fmt$(sz.rec):"— not enough data"}</b></div>
+        ${sz.rec!=null?`<div class="lgrow"><span>Binding constraint</span><b>${sz.binding}</b></div>`:""}
+        <div class="lgrow"><span>Your current position</span><b>${fmt$(lastUsd)}/leg</b></div>
+        ${sz.fragile?'<div class="dsub" style="color:var(--gold);margin-top:8px">⚠ Open interest far exceeds resting depth on at least one leg — size down further than shown.</div>':""}
+      </div>
     </div>
-    <div class="dnote">Depth is CoinGlass's aggregated liquidity within ±1% of mid — not live top-of-book quotes. Verify final prices on the exchange before firing. Buying consumes asks; selling consumes bids.</div>
+    <div class="dnote">Funding rate is from the live scan. Price/volume/OI from CoinGlass pairs-markets. Depth is CoinGlass's aggregated liquidity within ±0.25% of mid (tightest band available — not a live top-of-book quote). Buying consumes asks; selling consumes bids.</div>
+    <div class="btbar">
+      <button class="btbtn livebtn" data-sym="${d.symbol}" data-longex="${d.buy.exchange}" data-shortex="${d.sell.exchange}">⚡ GET LIVE TOP-OF-BOOK</button>
+      <span class="bthint">fetches the real best bid/ask directly from ${d.buy.exchange} &amp; ${d.sell.exchange} — bypasses CoinGlass entirely</span>
+    </div>
     <div class="btbar">
       <button class="btbtn" data-sym="${d.symbol}">▶ BACKTEST & RECOMMEND STRATEGY</button>
       <span class="bthint">replays ~21 days of funding, price & depth history for this pair</span>
@@ -2013,13 +2479,48 @@ async function runSingleBacktest(d, out, btn, opts){
 }
 
 document.addEventListener("click", e=>{
-  const b = e.target.closest(".btbtn");
+  const b = e.target.closest(".btbtn:not(.livebtn)");
   if(!b) return;
   const sym = b.dataset.sym;
   const item = lastList.find(o=>o.d.symbol===sym);
   if(!item) return;
   const out = b.closest(".depthwrap").querySelector(".btout");
   runSingleBacktest(item.d, out, b);
+});
+
+async function fetchLiveTopOfBook(exchange, symbol){
+  try{
+    const r = await fetch(`/api/live-book?exchange=${encodeURIComponent(exchange)}&symbol=${encodeURIComponent(symbol)}`);
+    return await r.json();
+  }catch(e){
+    return {code:"error", msg:String(e.message)};
+  }
+}
+
+function renderLiveSlot(j){
+  if(String(j.code)!=="0"){
+    const msg = (j.msg||"unavailable").slice(0,90);
+    return `<span>Live top-of-book</span><b class="r-dim" title="${(j.msg||"").replace(/"/g,'&quot;')}">${msg} ⓘ</b>`;
+  }
+  return `<span>Live top-of-book (${j.symbol})</span>
+    <b>bid ${fmtPx(j.best_bid)} / ask ${fmtPx(j.best_ask)}${j.spread_pct!=null?` · spread ${j.spread_pct.toFixed(3)}%`:""}</b>`;
+}
+
+document.addEventListener("click", async e=>{
+  const b = e.target.closest(".livebtn");
+  if(!b) return;
+  const sym = b.dataset.sym, lex = b.dataset.longex, sex = b.dataset.shortex;
+  const longSlot = document.getElementById(`live-lg-long-${sym}`);
+  const shortSlot = document.getElementById(`live-lg-short-${sym}`);
+  b.disabled = true; const old = b.textContent; b.textContent = "FETCHING…";
+  if(longSlot) longSlot.innerHTML = `<span>Live top-of-book</span><b class="r-dim">fetching…</b>`;
+  if(shortSlot) shortSlot.innerHTML = `<span>Live top-of-book</span><b class="r-dim">fetching…</b>`;
+  const [lj, sj] = await Promise.all([
+    fetchLiveTopOfBook(lex, sym), fetchLiveTopOfBook(sex, sym)
+  ]);
+  if(longSlot) longSlot.innerHTML = renderLiveSlot(lj);
+  if(shortSlot) shortSlot.innerHTML = renderLiveSlot(sj);
+  b.disabled = false; b.textContent = old;
 });
 
 function fmtPct4v(n){ return (n>=0?"+":"")+Number(n).toFixed(4)+"%"; }
@@ -2071,7 +2572,7 @@ function btReport(j, d){
       <div class="pbrow"><b>Expected</b><b class="${r.expected_net_pct>=0?'r-long':'r-short'}">${(r.expected_net_pct>=0?"+":"")+r.expected_net_pct}%</b>
         (≈ $${r.expected_net_usd.toLocaleString()}) per trade at the recommended size, after fees & modeled slippage.</div>
       ${warn}
-      <div class="dsub" style="margin-top:8px">Derived from ${s.trades} historical trades over ${s.days} days. Settled rates only (no intra-period prediction), hourly ±1% depth snapshots, survivorship bias applies. A guide, not a guarantee.</div>
+      <div class="dsub" style="margin-top:8px">Derived from ${s.trades} historical trades over ${s.days} days. Settled rates only (no intra-period prediction), hourly ±0.25% top-of-book depth snapshots, survivorship bias applies. A guide, not a guarantee.</div>
     </div>
   </div>`;
 }
@@ -2131,6 +2632,17 @@ document.querySelectorAll(".navitem").forEach(nav=>{
     nav.classList.add("active");
     if(nav.dataset.page==="page-backtest") populateBt2Pick();
     if(nav.dataset.page==="page-calc") populateCPick();
+    if(nav.dataset.page==="page-news" && $("nSym")) $("nSym").focus();
+  });
+});
+
+// ---- sub-nav inside the Guides page ----
+document.querySelectorAll(".subnavbtn").forEach(btn=>{
+  btn.addEventListener("click", ()=>{
+    document.querySelectorAll(".subpage").forEach(p=>p.classList.remove("active"));
+    document.querySelectorAll(".subnavbtn").forEach(b=>b.classList.remove("active"));
+    document.getElementById(btn.dataset.sub).classList.add("active");
+    btn.classList.add("active");
   });
 });
 
@@ -2158,7 +2670,7 @@ $("cPick").addEventListener("change", ()=>{
 });
 
 const CFIELDS = ["cSym","cUsd","cLev","cLongEx","cLongRate","cLongInt","cShortEx","cShortRate","cShortInt",
-                 "cPxLE","cPxSE","cPxIE","cPxLX","cPxSX","cPxIX","cOiL","cOiS","cHold","cFee"];
+                 "cPxLE","cPxSE","cPxIE","cPxLX","cPxSX","cPxIX","cOiL","cOiS","cDepthL","cDepthS","cHold","cFee"];
 CFIELDS.forEach(id=>{ const el=$(id); if(el) el.addEventListener("input", calcRender); });
 
 async function fetchCalcLivePrices(){
@@ -2181,7 +2693,13 @@ async function fetchCalcLivePrices(){
     if(idx!=null) $("cPxIX").value = idx;
     if(j.long.oi_usd!=null) $("cOiL").value = Math.round(j.long.oi_usd);
     if(j.short.oi_usd!=null) $("cOiS").value = Math.round(j.short.oi_usd);
-    $("cFetchStatus").textContent = "Live prices loaded — exit fields default to entry, edit them to model a scenario.";
+    // also pull order book depth (reuses the same fetcher as the live table's depth panel)
+    try{
+      const [obL, obS] = await Promise.all([fetchDepth(lx, sym), fetchDepth(sx, sym)]);
+      if(obL && obL.latest) $("cDepthL").value = Math.round(obL.latest.asks_usd);
+      if(obS && obS.latest) $("cDepthS").value = Math.round(obS.latest.bids_usd);
+    }catch(e){ /* depth optional — leave fields as-is if it fails */ }
+    $("cFetchStatus").textContent = "Live prices, OI &amp; depth loaded — exit fields default to entry, edit them to model a scenario.";
     calcRender();
   }catch(err){
     $("cFetchStatus").textContent = "Fetch error: "+String(err.message).slice(0,120);
@@ -2209,6 +2727,7 @@ function calcRender(){
   const hold = Math.max(1, Number($("cHold").value)||24);
   const feeRT = Math.max(0, Number($("cFee").value)||0);
   const oiL = Number($("cOiL").value)||0, oiS = Number($("cOiS").value)||0;
+  const depthL = Number($("cDepthL").value)||0, depthS = Number($("cDepthS").value)||0;
   const pctOiL = oiL>0 ? usd/oiL*100 : null;
   const pctOiS = oiS>0 ? usd/oiS*100 : null;
   const impactTag = p => p==null ? ['na','NO OI DATA — fetch or enter manually'] :
@@ -2284,6 +2803,7 @@ function calcRender(){
       <span class="cformula">$${usd.toLocaleString()} ÷ ${oiS?fmtMoney(oiS):"?"} OI ${pctOiS!=null?"= "+pctOiS.toFixed(3)+"%":""}</span></div>
       <div class="cval dchk ${itClsS}" style="border:none;background:none;padding:0">${itTxtS}</div></div>
     <div class="dsub" style="margin-top:6px">Rule of thumb: under ~0.5% of a venue's OI, your own order is unlikely to be the reason the price or funding rate moves. Above ~2%, assume you ARE the marginal flow — your entry price will likely be worse than the quote you're calculating from, and the funding rate can compress toward zero as you enter. Use "Fetch live prices &amp; OI" above, or enter OI manually from the Coin Research or Live Table pages.</div>
+    ${recCard(recommendSize(depthL, depthS, depthL>0&&depthS>0, oiL||null, oiS||null), usd)}
   </div>
 
   <div class="cstep">
@@ -2431,6 +2951,88 @@ function renderCoinInfo(sym, list){
     <tbody>${rows_}</tbody>
   </table></div>
   <div class="dsub" style="margin-top:8px">Data: CoinGlass pairs-markets, all exchanges tracking ${sym}. "Long liq" = longs force-closed in the last 24h (a squeeze-down signal); "Short liq" = shorts force-closed (a squeeze-up signal). Sorted by open interest.</div>`;
+}
+
+// ==================== PAGE 7: news & sentiment ====================
+function fmtAge(h){
+  if(h==null) return "";
+  if(h<1) return Math.round(h*60)+"m ago";
+  if(h<24) return Math.round(h)+"h ago";
+  return Math.round(h/24)+"d ago";
+}
+async function searchNews(){
+  const q = $("nSym").value.trim();
+  if(!q) return;
+  $("nOut").innerHTML = '<div class="btload">Searching Google News and Reddit for "'+q+'"…</div>';
+  try{
+    const r = await fetch("/api/news?q="+encodeURIComponent(q));
+    const j = await r.json();
+    if(String(j.code)!=="0") throw new Error(j.msg||"search failed");
+    $("nOut").innerHTML = renderNews(q, j);
+  }catch(err){
+    $("nOut").innerHTML = '<div class="btload r-short">Error: '+String(err.message).slice(0,300)+'</div>';
+  }
+}
+$("nSearch").onclick = searchNews;
+$("nSym").addEventListener("keydown", e=>{ if(e.key==="Enter") searchNews(); });
+
+function renderNews(q, j){
+  const s = j.summary;
+  const spike = s.items_24h >= 5;
+  const overallCls = s.overall==="bullish"?"r-long":s.overall==="bearish"?"r-short":s.overall==="mixed"?"r-apr":"r-dim";
+  const summary = `<div class="btgrid" style="grid-template-columns:repeat(5,minmax(0,1fr));margin-bottom:16px">
+    <div class="btstat"><div class="pxlabel">Overall tone</div><div class="btval ${overallCls}">${s.overall.toUpperCase()}</div></div>
+    <div class="btstat"><div class="pxlabel">Items found</div><div class="btval">${s.total_items}</div></div>
+    <div class="btstat"><div class="pxlabel">Last 24h</div><div class="btval ${spike?'r-apr':''}">${s.items_24h}${spike?' <span class="spikebadge">SPIKE</span>':''}</div></div>
+    <div class="btstat"><div class="pxlabel">Bullish / Bearish tags</div><div class="btval">${s.bullish_count} / ${s.bearish_count}</div></div>
+    <div class="btstat"><div class="pxlabel">Last 7 days</div><div class="btval">${s.items_7d}</div></div>
+  </div>`;
+
+  const headlineList = j.headlines.length ? j.headlines.map(x=>`<div class="newsitem headline">
+      <div class="nmeta">${fmtAge(x.age_hours)}</div>
+      <div class="nbody">
+        <div class="ntitle" style="font-size:14px"><a href="${x.link}" target="_blank" rel="noopener">${x.title}</a>
+          <span class="sentbadge ${x.sentiment}" style="margin-left:6px;font-size:9px;padding:2px 6px">${x.sentiment}</span></div>
+        <div class="nsource">${x.desc||""}</div>
+      </div></div>`).join("")
+    : `<div class="dsub">No CoinDesk coverage directly mentioning "${q}" in their recent feed.${j.headlines_error?" ("+j.headlines_error.slice(0,150)+")":""}</div>`;
+
+  const headlinesPanel = `<div class="btpanel headlines" style="margin-bottom:16px">
+    <div class="pbtitle" style="margin-bottom:8px">HEADLINES <span>· CoinDesk mentioning "${q}"</span></div>
+    ${headlineList}
+  </div>`;
+
+  const newsList = j.news.length ? j.news.map(x=>`<div class="newsitem">
+      <div class="nmeta">${fmtAge(x.age_hours)}</div>
+      <div class="nbody">
+        <div class="ntitle"><a href="${x.link}" target="_blank" rel="noopener">${x.title}</a>
+          <span class="sentbadge ${x.sentiment}" style="margin-left:6px;font-size:9px;padding:2px 6px">${x.sentiment}</span></div>
+        <div class="nsource">${x.source||""}</div>
+      </div></div>`).join("")
+    : `<div class="dsub">No Google News results.${j.news_error?" ("+j.news_error.slice(0,150)+")":""}</div>`;
+
+  const redditList = j.reddit.length ? j.reddit.map(x=>`<div class="newsitem">
+      <div class="nmeta">${fmtAge(x.age_hours)}</div>
+      <div class="nbody">
+        <div class="ntitle"><a href="${x.link}" target="_blank" rel="noopener">${x.title}</a>
+          <span class="sentbadge ${x.sentiment}" style="margin-left:6px;font-size:9px;padding:2px 6px">${x.sentiment}</span></div>
+        <div class="nsource">r/${x.subreddit} · ${x.ups} upvotes · ${x.comments} comments</div>
+      </div></div>`).join("")
+    : `<div class="dsub">No Reddit posts directly mentioning "${q}" found.${j.reddit_error?" ("+j.reddit_error.slice(0,150)+")":""}</div>`;
+
+  return summary + headlinesPanel + `
+  <div class="pxlabel" style="margin-bottom:8px">OTHER COVERAGE</div>
+  <div class="btrow2" style="grid-template-columns:1fr 1fr">
+    <div class="btpanel">
+      <div class="pbtitle" style="margin-bottom:6px">GOOGLE NEWS <span>(all sources)</span></div>
+      ${newsList}
+    </div>
+    <div class="btpanel">
+      <div class="pbtitle" style="margin-bottom:6px">REDDIT</div>
+      ${redditList}
+    </div>
+  </div>
+  <div class="dsub" style="margin-top:10px">Sentiment tags are a simple keyword count (words like "surge", "hack", "lawsuit"), not real NLP — treat as a rough flag to investigate, not a signal to trade on. "SPIKE" = 5+ items in the last 24h, worth checking before entering or holding a position in this coin.</div>`;
 }
 </script>
 </body>
