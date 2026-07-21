@@ -615,6 +615,25 @@ def arb():
     return jsonify(data)
 
 
+@app.route("/api/keepalive")
+def keepalive():
+    """Ping target for an external cron service (e.g. cron-job.org).
+    Keeps the free instance awake AND refreshes the arb scan cache,
+    so data is current even if nobody has the page open."""
+    try:
+        resp = _throttled_get(
+            COINGLASS_URL, params={"usd": 10000},
+            headers={"accept": "application/json", "CG-API-KEY": API_KEY}, timeout=15)
+        data = resp.json()
+        if str(data.get("code")) == "0":
+            _cache.update({"ts": time.time(), "usd": 10000, "payload": data})
+            return jsonify({"code": "0", "status": "awake", "scan_refreshed": True,
+                            "pairs": len(data.get("data", [])), "time": time.time()})
+        return jsonify({"code": "0", "status": "awake", "scan_refreshed": False, "msg": data.get("msg")})
+    except Exception as exc:
+        return jsonify({"code": "0", "status": "awake", "scan_refreshed": False, "msg": str(exc)})
+
+
 @app.route("/")
 def index():
     return PAGE
@@ -825,6 +844,34 @@ PAGE = r"""<!DOCTYPE html>
   .dchk.ok{color:var(--long);border-color:rgba(53,217,188,.35)}
   .dchk.bad{color:var(--short);border-color:rgba(255,100,112,.4);background:var(--short-dim)}
   .dchk.unk{color:var(--faint)}
+
+  /* ---- profit calculator ---- */
+  .calcgrid{display:grid;grid-template-columns:340px minmax(0,1fr);gap:16px;align-items:start}
+  @media(max-width:900px){.calcgrid{grid-template-columns:1fr}}
+  .cfield{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:5px 0}
+  .cfield label{font-size:11px;color:var(--muted);flex:1}
+  .cfield input{background:var(--panel-2);border:1px solid var(--edge);color:var(--text);
+    font-family:var(--mono);font-size:12px;padding:6px 8px;border-radius:5px;width:120px;text-align:right}
+  .cfield input:focus{outline:2px solid var(--gold);outline-offset:1px}
+  .cstep{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:16px 18px;margin-bottom:14px}
+  .cstep .pbtitle{margin-bottom:10px}
+  .cline{display:flex;justify-content:space-between;gap:14px;padding:6px 0;border-top:1px solid var(--edge);
+    font-size:12px;align-items:baseline}
+  .cline:first-of-type{border-top:0}
+  .cline .clabel{color:var(--muted)}
+  .cline .cformula{color:var(--faint);font-size:10px;display:block;margin-top:2px}
+  .cline .cval{color:var(--text);font-weight:600;white-space:nowrap}
+  .ctotal{display:flex;justify-content:space-between;align-items:center;padding-top:10px;margin-top:6px;
+    border-top:2px solid var(--edge)}
+  .ctotal .clabel{font-family:var(--disp);font-weight:700;font-size:13px;color:var(--text)}
+  .ctotal .cval{font-family:var(--disp);font-weight:700;font-size:22px}
+  .flowrow{display:flex;align-items:center;gap:0;margin-bottom:14px;flex-wrap:wrap}
+  .flowcard{flex:1;min-width:160px;background:var(--panel-2);border:1px solid var(--edge);border-radius:8px;padding:12px 14px}
+  .flowcard.l{border-top:3px solid var(--long)}
+  .flowcard.s{border-top:3px solid var(--short)}
+  .flowarrow{flex:0 0 40px;text-align:center;color:var(--gold);font-size:18px}
+  .flowcard .fttl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);margin-bottom:6px}
+  .flowcard .fval{font-size:16px;font-weight:600}
   tr.browrank{cursor:pointer}
   tr.browdetail td{background:var(--panel-2);white-space:normal;overflow-wrap:anywhere}
   .browdetailwrap{padding:10px 14px;display:flex;flex-direction:column;gap:6px}
@@ -873,7 +920,8 @@ PAGE = r"""<!DOCTYPE html>
   <div class="navitem active" data-page="page-arb"><span class="navnum">01</span>Live Arbitrage Table</div>
   <div class="navitem" data-page="page-backtest"><span class="navnum">02</span>Run Backtest</div>
   <div class="navitem" data-page="page-history"><span class="navnum">03</span>Coin Research</div>
-  <div class="navitem" data-page="page-explain"><span class="navnum">04</span>How This Trade Works</div>
+  <div class="navitem" data-page="page-calc"><span class="navnum">04</span>Profit Calculator</div>
+  <div class="navitem" data-page="page-explain"><span class="navnum">05</span>How This Trade Works</div>
 </nav>
 <div class="pagearea">
 
@@ -1073,6 +1121,51 @@ PAGE = r"""<!DOCTYPE html>
 
 </main>
 </div>
+
+<div class="page" id="page-calc">
+<header style="border-bottom:1px solid var(--edge);padding:28px 32px 20px">
+  <div class="brand">
+    <h1>PROFIT <span>CALCULATOR</span></h1>
+    <p>Every line of the math shown explicitly — funding on each leg, the price-gap trade, fees, and what's left over.</p>
+  </div>
+</header>
+<main style="padding:20px 32px 70px;max-width:1280px;margin:0 auto">
+
+  <div class="controls" style="gap:10px;margin-bottom:16px">
+    <div class="ctl"><label for="cPick">Load a live pair</label>
+      <select id="cPick" style="width:260px"><option value="">— manual entry —</option></select></div>
+  </div>
+
+  <div class="calcgrid">
+    <div class="btpanel">
+      <div class="pxlabel" style="margin-bottom:10px">1 · POSITION &amp; LEVERAGE</div>
+      <div class="cfield"><label>Symbol</label><input id="cSym" value="COIN"></div>
+      <div class="cfield"><label>Position size per leg (USD)</label><input id="cUsd" type="number" value="10000" step="500"></div>
+      <div class="cfield"><label>Leverage per leg</label><input id="cLev" type="number" value="3" min="1" step="1"></div>
+
+      <div class="pxlabel" style="margin:16px 0 10px">2 · FUNDING RATES</div>
+      <div class="cfield"><label>Long venue name</label><input id="cLongEx" value="Exchange A"></div>
+      <div class="cfield"><label>Long funding rate (%/settlement)</label><input id="cLongRate" type="number" value="-0.50" step="0.01"></div>
+      <div class="cfield"><label>Long settles every (hours)</label><input id="cLongInt" type="number" value="4" min="1" step="1"></div>
+      <div class="cfield"><label>Short venue name</label><input id="cShortEx" value="Exchange B"></div>
+      <div class="cfield"><label>Short funding rate (%/settlement)</label><input id="cShortRate" type="number" value="0.02" step="0.01"></div>
+      <div class="cfield"><label>Short settles every (hours)</label><input id="cShortInt" type="number" value="8" min="1" step="1"></div>
+
+      <div class="pxlabel" style="margin:16px 0 10px">3 · PRICE AT ENTRY &amp; EXIT (optional — leave equal for no gap)</div>
+      <div class="cfield"><label>Long price at entry</label><input id="cPxLE" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Short price at entry</label><input id="cPxSE" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Long price at exit</label><input id="cPxLX" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Short price at exit</label><input id="cPxSX" type="number" value="1.0000" step="0.0001"></div>
+
+      <div class="pxlabel" style="margin:16px 0 10px">4 · HOLD &amp; COSTS</div>
+      <div class="cfield"><label>Hold duration (hours)</label><input id="cHold" type="number" value="24" min="1" step="1"></div>
+      <div class="cfield"><label>Round-trip fee, both legs (%)</label><input id="cFee" type="number" value="0.12" step="0.01"></div>
+    </div>
+
+    <div id="cOut"></div>
+  </div>
+</main>
+</div><!-- /page-calc -->
 
 </div><!-- /pagearea -->
 </div><!-- /applayout -->
@@ -1874,10 +1967,158 @@ document.querySelectorAll(".navitem").forEach(nav=>{
     document.getElementById(nav.dataset.page).classList.add("active");
     nav.classList.add("active");
     if(nav.dataset.page==="page-backtest") populateBt2Pick();
+    if(nav.dataset.page==="page-calc") populateCPick();
   });
 });
 
-// ==================== PAGE 2: manual single-pair backtest ====================
+// ==================== PAGE 5: profit calculator ====================
+function populateCPick(){
+  const sel = $("cPick");
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">— manual entry —</option>' +
+    rows.map((d,i)=>`<option value="${i}">${d.symbol} · ${d.buy.exchange} → ${d.sell.exchange}</option>`).join("");
+  if(cur) sel.value = cur;
+}
+$("cPick").addEventListener("change", ()=>{
+  const i = $("cPick").value;
+  if(i==="") return;
+  const d = rows[Number(i)];
+  $("cSym").value = d.symbol;
+  $("cLongEx").value = d.buy.exchange;
+  $("cLongRate").value = d.buy.funding_rate;
+  $("cLongInt").value = d.buy.funding_rate_interval;
+  $("cShortEx").value = d.sell.exchange;
+  $("cShortRate").value = d.sell.funding_rate;
+  $("cShortInt").value = d.sell.funding_rate_interval;
+  $("cFee").value = (2*d.fee).toFixed(3);
+  calcRender();
+});
+
+const CFIELDS = ["cSym","cUsd","cLev","cLongEx","cLongRate","cLongInt","cShortEx","cShortRate","cShortInt",
+                 "cPxLE","cPxSE","cPxLX","cPxSX","cHold","cFee"];
+CFIELDS.forEach(id=>{ const el=$(id); if(el) el.addEventListener("input", calcRender); });
+
+function fmtMoney(n){ const s = n<0?"−":""; return s+"$"+Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function fmtPct4(n){ return (n>=0?"+":"")+Number(n).toFixed(4)+"%"; }
+
+function calcRender(){
+  const sym = $("cSym").value.trim() || "COIN";
+  const usd = Math.max(0, Number($("cUsd").value)||0);
+  const lev = Math.max(1, Number($("cLev").value)||1);
+  const lEx = $("cLongEx").value.trim() || "Long venue";
+  const sEx = $("cShortEx").value.trim() || "Short venue";
+  const lRate = Number($("cLongRate").value)||0;
+  const sRate = Number($("cShortRate").value)||0;
+  const lInt = Math.max(1, Number($("cLongInt").value)||8);
+  const sInt = Math.max(1, Number($("cShortInt").value)||8);
+  const pxLE = Number($("cPxLE").value)||1, pxSE = Number($("cPxSE").value)||1;
+  const pxLX = Number($("cPxLX").value)||1, pxSX = Number($("cPxSX").value)||1;
+  const hold = Math.max(1, Number($("cHold").value)||24);
+  const feeRT = Math.max(0, Number($("cFee").value)||0);
+
+  // --- step A: capital ---
+  const capital = 2*usd/lev;
+
+  // --- step B: funding, leg by leg, counting real settlements over the hold window ---
+  const longN = Math.floor(hold / lInt);
+  const shortN = Math.floor(hold / sInt);
+  const longFundingUsd = -longN * usd * lRate/100;   // long PAYS the rate (earns if negative)
+  const shortFundingUsd = shortN * usd * sRate/100;  // short COLLECTS the rate
+  const netFundingUsd = longFundingUsd + shortFundingUsd;
+
+  // --- step C: price gap trade ---
+  const entryGap = pxSE!==0 ? (pxSE - pxLE)/pxSE*100 : 0;
+  const exitGap = pxSX!==0 ? (pxSX - pxLX)/pxSX*100 : 0;
+  const gapPnlPct = entryGap - exitGap;
+  const gapPnlUsd = usd * gapPnlPct/100;
+
+  // --- step D: costs ---
+  const feeUsd = usd * feeRT/100;
+
+  // --- step E: total ---
+  const netUsd = netFundingUsd + gapPnlUsd - feeUsd;
+  const roc = capital>0 ? netUsd/capital*100 : 0;
+
+  const out = $("cOut");
+  out.innerHTML = `
+  <div class="cstep">
+    <div class="pbtitle">TRADE FLOW</div>
+    <div class="flowrow">
+      <div class="flowcard l">
+        <div class="fttl">Long · ${lEx}</div>
+        <div class="fval r-long">${fmtPct4(lRate)} / ${lInt}h</div>
+        <div class="dsub">${longN} settlement(s) over ${hold}h</div>
+        <div class="dsub">price: $${pxLE} → $${pxLX}</div>
+      </div>
+      <div class="flowarrow">＋</div>
+      <div class="flowcard s">
+        <div class="fttl">Short · ${sEx}</div>
+        <div class="fval r-short">${fmtPct4(sRate)} / ${sInt}h</div>
+        <div class="dsub">${shortN} settlement(s) over ${hold}h</div>
+        <div class="dsub">price: $${pxSE} → $${pxSX}</div>
+      </div>
+      <div class="flowarrow">＝</div>
+      <div class="flowcard" style="border-top:3px solid var(--gold)">
+        <div class="fttl">Net result, ${sym}</div>
+        <div class="fval ${netUsd>=0?'r-long':'r-short'}">${fmtMoney(netUsd)}</div>
+        <div class="dsub">${roc.toFixed(1)}% ROC on ${fmtMoney(capital)} capital</div>
+      </div>
+    </div>
+    <div class="dsub">Capital = 2 × position ÷ leverage = 2 × $${usd.toLocaleString()} ÷ ${lev} = ${fmtMoney(capital)} (margin posted on both exchanges).</div>
+  </div>
+
+  <div class="cstep">
+    <div class="pbtitle">STEP 1 — FUNDING P&amp;L (the recurring income)</div>
+    <div class="cline"><div><div class="clabel">Long leg — ${lRate<0?'<b class="r-long">you RECEIVE</b> this rate (negative funding pays the long side)':'<b class="r-short">you PAY</b> this rate (positive funding: longs pay shorts)'}</div>
+      <span class="cformula">−${longN} × $${usd.toLocaleString()} × (${lRate}%) = ${fmtMoney(longFundingUsd)}</span></div>
+      <div class="cval ${longFundingUsd>=0?'r-long':'r-short'}">${fmtMoney(longFundingUsd)}</div></div>
+    <div class="cline"><div><div class="clabel">Short leg — ${sRate>=0?'<b class="r-long">you RECEIVE</b> this rate (positive funding: longs pay shorts, you are short)':'<b class="r-short">you PAY</b> this rate (negative funding pays the long side, you are short)'}</div>
+      <span class="cformula">+${shortN} × $${usd.toLocaleString()} × (${sRate}%) = ${fmtMoney(shortFundingUsd)}</span></div>
+      <div class="cval ${shortFundingUsd>=0?'r-long':'r-short'}">${fmtMoney(shortFundingUsd)}</div></div>
+    <div class="ctotal"><div class="clabel">Net funding collected</div>
+      <div class="cval ${netFundingUsd>=0?'r-long':'r-short'}">${fmtMoney(netFundingUsd)}</div></div>
+  </div>
+
+  <div class="cstep">
+    <div class="pbtitle">STEP 2 — PRICE DISCREPANCY P&amp;L (one-shot, pays only if the gap converges)</div>
+    <div class="cline"><div><div class="clabel">Entry gap (short price vs long price)</div>
+      <span class="cformula">(${pxSE} − ${pxLE}) ÷ ${pxSE} × 100 = ${fmtPct4(entryGap)}</span></div>
+      <div class="cval">${fmtPct4(entryGap)}</div></div>
+    <div class="cline"><div><div class="clabel">Exit gap (short price vs long price)</div>
+      <span class="cformula">(${pxSX} − ${pxLX}) ÷ ${pxSX} × 100 = ${fmtPct4(exitGap)}</span></div>
+      <div class="cval">${fmtPct4(exitGap)}</div></div>
+    <div class="cline"><div><div class="clabel">Gap P&amp;L % — you sold the rich side, bought the cheap side at entry</div>
+      <span class="cformula">entry gap − exit gap = ${fmtPct4(entryGap)} − ${fmtPct4(exitGap)} = ${fmtPct4(gapPnlPct)}</span></div>
+      <div class="cval ${gapPnlPct>=0?'r-long':'r-short'}">${fmtPct4(gapPnlPct)}</div></div>
+    <div class="ctotal"><div class="clabel">Gap P&amp;L in dollars</div>
+      <span class="cformula" style="margin-right:auto"></span>
+      <div class="cval ${gapPnlUsd>=0?'r-long':'r-short'}">${fmtMoney(gapPnlUsd)}</div></div>
+    <div class="dsub" style="margin-top:6px">If the gap doesn't move, this is $0 — it only pays you when the dislocation that created the opportunity normalizes while you're positioned for it. If the gap widens against you, this line goes negative.</div>
+  </div>
+
+  <div class="cstep">
+    <div class="pbtitle">STEP 3 — COSTS</div>
+    <div class="cline"><div><div class="clabel">Round-trip fees, both legs, open + close</div>
+      <span class="cformula">$${usd.toLocaleString()} × ${feeRT}% = ${fmtMoney(feeUsd)}</span></div>
+      <div class="cval r-short">−${fmtMoney(feeUsd)}</div></div>
+  </div>
+
+  <div class="cstep" style="border-color:var(--gold)">
+    <div class="pbtitle">STEP 4 — NET RESULT</div>
+    <div class="cline"><div class="clabel">Funding P&amp;L</div><div class="cval ${netFundingUsd>=0?'r-long':'r-short'}">${fmtMoney(netFundingUsd)}</div></div>
+    <div class="cline"><div class="clabel">+ Gap P&amp;L</div><div class="cval ${gapPnlUsd>=0?'r-long':'r-short'}">${fmtMoney(gapPnlUsd)}</div></div>
+    <div class="cline"><div class="clabel">− Fees</div><div class="cval r-short">−${fmtMoney(feeUsd)}</div></div>
+    <div class="ctotal"><div class="clabel">NET PROFIT</div><div class="cval ${netUsd>=0?'r-long':'r-short'}">${fmtMoney(netUsd)}</div></div>
+    <div class="cline" style="border-top:1px dashed var(--edge);margin-top:8px;padding-top:10px">
+      <div class="clabel">Return on capital (ROC)</div>
+      <span class="cformula">${fmtMoney(netUsd)} ÷ ${fmtMoney(capital)} × 100</span></div>
+      <div class="cval ${roc>=0?'r-long':'r-short'}" style="font-size:20px">${roc.toFixed(2)}%</div>
+    <div class="dsub" style="margin-top:8px">This is arithmetic on the numbers you entered, not a forecast — real funding rates, prices and fills will differ. Use it to sanity-check a scenario, or plug in numbers from the Backtest or Live Table pages.</div>
+  </div>`;
+}
+calcRender();
+
+
 function populateBt2Pick(){
   const sel = $("bt2Pick");
   const cur = sel.value;
