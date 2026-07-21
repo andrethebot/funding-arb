@@ -1151,11 +1151,13 @@ PAGE = r"""<!DOCTYPE html>
       <div class="cfield"><label>Short funding rate (%/settlement)</label><input id="cShortRate" type="number" value="0.02" step="0.01"></div>
       <div class="cfield"><label>Short settles every (hours)</label><input id="cShortInt" type="number" value="8" min="1" step="1"></div>
 
-      <div class="pxlabel" style="margin:16px 0 10px">3 · PRICE AT ENTRY &amp; EXIT (optional — leave equal for no gap)</div>
+      <div class="pxlabel" style="margin:16px 0 10px">3 · PRICES — FUTURES (per venue) &amp; UNDERLYING/INDEX</div>
       <div class="cfield"><label>Long price at entry</label><input id="cPxLE" type="number" value="1.0000" step="0.0001"></div>
       <div class="cfield"><label>Short price at entry</label><input id="cPxSE" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Index/spot price at entry</label><input id="cPxIE" type="number" value="1.0000" step="0.0001"></div>
       <div class="cfield"><label>Long price at exit</label><input id="cPxLX" type="number" value="1.0000" step="0.0001"></div>
       <div class="cfield"><label>Short price at exit</label><input id="cPxSX" type="number" value="1.0000" step="0.0001"></div>
+      <div class="cfield"><label>Index/spot price at exit</label><input id="cPxIX" type="number" value="1.0000" step="0.0001"></div>
 
       <div class="pxlabel" style="margin:16px 0 10px">4 · HOLD &amp; COSTS</div>
       <div class="cfield"><label>Hold duration (hours)</label><input id="cHold" type="number" value="24" min="1" step="1"></div>
@@ -1865,12 +1867,16 @@ document.addEventListener("click", e=>{
   runSingleBacktest(item.d, out, b);
 });
 
+function fmtPct4v(n){ return (n>=0?"+":"")+Number(n).toFixed(4)+"%"; }
+
 function btReport(j, d){
   if(!j.summary){
     return `<div class="btload">${j.msg||"No trades found."}<br>
       Depth-rejected signals: ${j.depth?j.depth.rejected:0} · no depth data: ${j.depth?j.depth.nodata:0}</div>`;
   }
   const s = j.summary, r = j.rec;
+  const avgEntryGap = j.trades && j.trades.length ?
+    j.trades.reduce((a,t)=>a+(t.gap_entry||0),0)/j.trades.length : null;
   const stat = (label,val,cls)=>`<div class="btstat"><div class="pxlabel">${label}</div><div class="btval ${cls||""}">${val}</div></div>`;
   const maxd = Math.max(...j.decay.map(x=>Math.abs(x.avg)), 0.01);
   const decayBars = j.decay.map(x=>`<div class="dcol" title="cycle ${x.cycle}: ${x.avg>=0?"+":""}${x.avg}%">
@@ -1886,7 +1892,9 @@ function btReport(j, d){
     ${stat("Total net", (s.total_net>=0?"+":"")+s.total_net+"%", s.total_net>=0?"r-long":"r-short")}
     ${stat("Funding vs gap", (s.avg_funding>=0?"+":"")+s.avg_funding+"% / "+(s.avg_gap_pnl>=0?"+":"")+s.avg_gap_pnl+"%")}
     ${stat("Best / worst", "+"+s.best+"% / "+s.worst+"%")}
+    ${stat("Avg entry price gap", avgEntryGap!=null?fmtPct4v(avgEntryGap):"—", avgEntryGap>0?"r-long":"r-short")}
   </div>
+  <div class="dsub" style="margin:6px 0 -4px">Entry price gap = (short-venue futures price − long-venue futures price) ÷ short price, averaged across historical entries — the futures-price discrepancy between your two legs at the moment each trade opened (see the Profit Calculator for the full underlying/index breakdown on any single trade).</div>
   <div class="btrow2">
     <div class="btpanel">
       <div class="pxlabel">Edge decay after entry (avg diff %/cycle)</div>
@@ -1995,7 +2003,7 @@ $("cPick").addEventListener("change", ()=>{
 });
 
 const CFIELDS = ["cSym","cUsd","cLev","cLongEx","cLongRate","cLongInt","cShortEx","cShortRate","cShortInt",
-                 "cPxLE","cPxSE","cPxLX","cPxSX","cHold","cFee"];
+                 "cPxLE","cPxSE","cPxIE","cPxLX","cPxSX","cPxIX","cHold","cFee"];
 CFIELDS.forEach(id=>{ const el=$(id); if(el) el.addEventListener("input", calcRender); });
 
 function fmtMoney(n){ const s = n<0?"−":""; return s+"$"+Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
@@ -2013,8 +2021,13 @@ function calcRender(){
   const sInt = Math.max(1, Number($("cShortInt").value)||8);
   const pxLE = Number($("cPxLE").value)||1, pxSE = Number($("cPxSE").value)||1;
   const pxLX = Number($("cPxLX").value)||1, pxSX = Number($("cPxSX").value)||1;
+  const pxIE = Number($("cPxIE").value)||1, pxIX = Number($("cPxIX").value)||1;
   const hold = Math.max(1, Number($("cHold").value)||24);
   const feeRT = Math.max(0, Number($("cFee").value)||0);
+
+  // deviation of each futures price from the underlying/index at entry & exit
+  const devLE = pxIE ? (pxLE-pxIE)/pxIE*100 : 0, devSE = pxIE ? (pxSE-pxIE)/pxIE*100 : 0;
+  const devLX = pxIX ? (pxLX-pxIX)/pxIX*100 : 0, devSX = pxIX ? (pxSX-pxIX)/pxIX*100 : 0;
 
   // --- step A: capital ---
   const capital = 2*usd/lev;
@@ -2048,14 +2061,16 @@ function calcRender(){
         <div class="fttl">Long · ${lEx}</div>
         <div class="fval r-long">${fmtPct4(lRate)} / ${lInt}h</div>
         <div class="dsub">${longN} settlement(s) over ${hold}h</div>
-        <div class="dsub">price: $${pxLE} → $${pxLX}</div>
+        <div class="dsub">futures: $${pxLE} → $${pxLX}</div>
+        <div class="dsub">vs index: ${fmtPct4(devLE)} → ${fmtPct4(devLX)}</div>
       </div>
       <div class="flowarrow">＋</div>
       <div class="flowcard s">
         <div class="fttl">Short · ${sEx}</div>
         <div class="fval r-short">${fmtPct4(sRate)} / ${sInt}h</div>
         <div class="dsub">${shortN} settlement(s) over ${hold}h</div>
-        <div class="dsub">price: $${pxSE} → $${pxSX}</div>
+        <div class="dsub">futures: $${pxSE} → $${pxSX}</div>
+        <div class="dsub">vs index: ${fmtPct4(devSE)} → ${fmtPct4(devSX)}</div>
       </div>
       <div class="flowarrow">＝</div>
       <div class="flowcard" style="border-top:3px solid var(--gold)">
@@ -2081,6 +2096,15 @@ function calcRender(){
 
   <div class="cstep">
     <div class="pbtitle">STEP 2 — PRICE DISCREPANCY P&amp;L (one-shot, pays only if the gap converges)</div>
+    <div class="cline"><div><div class="clabel">Underlying/index price — the reference both futures track</div>
+      <span class="cformula">entry $${pxIE} → exit $${pxIX}</span></div>
+      <div class="cval r-dim">reference</div></div>
+    <div class="cline"><div><div class="clabel">Long futures vs index (entry → exit)</div>
+      <span class="cformula">($${pxLE}−$${pxIE})÷$${pxIE} = ${fmtPct4(devLE)}  →  ($${pxLX}−$${pxIX})÷$${pxIX} = ${fmtPct4(devLX)}</span></div>
+      <div class="cval">${fmtPct4(devLE)} → ${fmtPct4(devLX)}</div></div>
+    <div class="cline"><div><div class="clabel">Short futures vs index (entry → exit)</div>
+      <span class="cformula">($${pxSE}−$${pxIE})÷$${pxIE} = ${fmtPct4(devSE)}  →  ($${pxSX}−$${pxIX})÷$${pxIX} = ${fmtPct4(devSX)}</span></div>
+      <div class="cval">${fmtPct4(devSE)} → ${fmtPct4(devSX)}</div></div>
     <div class="cline"><div><div class="clabel">Entry gap (short price vs long price)</div>
       <span class="cformula">(${pxSE} − ${pxLE}) ÷ ${pxSE} × 100 = ${fmtPct4(entryGap)}</span></div>
       <div class="cval">${fmtPct4(entryGap)}</div></div>
